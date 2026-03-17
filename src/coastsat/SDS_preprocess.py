@@ -971,7 +971,7 @@ def create_cloud_mask(im_QA, satname, cloud_mask_issue, collection):
     # erroneously identified as clouds by the CFMASK algorithm applied to the images by the USGS.
     if sum(sum(cloud_mask)) > 0 and sum(sum(~cloud_mask)) > 0:
         cloud_mask = morphology.remove_small_objects(
-            cloud_mask, min_size=40, connectivity=1
+            cloud_mask, max_size=39, connectivity=1
         )
     # this is only for if the cloud mask was applied to the shoreline accidentally
     if cloud_mask_issue:
@@ -983,7 +983,7 @@ def create_cloud_mask(im_QA, satname, cloud_mask_issue, collection):
                 cloud_mask_temp, elem
             )  # perform image opening
             cloud_mask_temp = morphology.remove_small_objects(
-                cloud_mask_temp, min_size=100, connectivity=1
+                cloud_mask_temp, max_size=99, connectivity=1
             )
             cloud_mask = np.logical_or(cloud_mask, cloud_mask_temp)
 
