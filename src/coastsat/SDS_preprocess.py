@@ -36,7 +36,6 @@ from typing import List, Dict, Any, Tuple, Union
 # CoastSat modules
 from coastsat import SDS_tools
 
-
 np.seterr(all="ignore")  # raise/ignore divisions by 0 and nans
 
 
@@ -216,9 +215,9 @@ def filter_images_by_cloud_cover_nodata(
     exceeds_cloud = max_cloud_cover is not None and cloud_cover > max_cloud_cover
 
     if exceeds_cloud_no_data:
-            exceeded_reasons.append(
-                f"percent_no_data (cloud_cover_combined) > {max_cloud_no_data_cover}"
-            )
+        exceeded_reasons.append(
+            f"percent_no_data (cloud_cover_combined) > {max_cloud_no_data_cover}"
+        )
     if exceeds_cloud:
         exceeded_reasons.append(f"cloud_cover > {max_cloud_cover}")
 
@@ -841,7 +840,7 @@ def preprocess_single(
             # Raise a skip-specific exception so callers can continue the batch
             # without receiving malformed placeholder arrays.
             raise SkipImageError(
-                f"Skipped image because Sentinel-2 multispectral file contains only zeros: {fn_ms}"
+                f"Skipped image because Sentinel-2 multispectral file contains only zeros: '{fn_ms}'"
             )
 
         im_swir = read_bands(fn_swir)[0] / 10000  # TOA scaled to 10000
@@ -1616,16 +1615,14 @@ def get_reference_sl(metadata, settings):
         apply_cloud_mask = settings.get("apply_cloud_mask", True)
         fn = SDS_tools.get_filenames(filenames[i], filepath, satname)
         try:
-            im_ms, georef, cloud_mask, im_extra, im_QA, im_nodata = (
-                preprocess_single(
-                    fn,
-                    satname,
-                    settings["cloud_mask_issue"],
-                    settings["pan_off"],
-                    collection,
-                    apply_cloud_mask,
-                    settings.get("s2cloudless_prob", 60),
-                )
+            im_ms, georef, cloud_mask, im_extra, im_QA, im_nodata = preprocess_single(
+                fn,
+                satname,
+                settings["cloud_mask_issue"],
+                settings["pan_off"],
+                collection,
+                apply_cloud_mask,
+                settings.get("s2cloudless_prob", 60),
             )
         except SkipImageError as exc:
             # Skip only the failing image and continue scanning the reference set.

@@ -967,14 +967,10 @@ def extract_shorelines(
                     f"{satname} {shoreline_date}: Skipped during preprocessing. {e}"
                 )
                 logger.warning(message)
-                print(f"\n{message}")
                 continue
             except FileNotFoundError as e:
                 logger.error(
                     f"Could not extract shoreline for {shoreline_date} due to missing files.{e}"
-                )
-                print(
-                    f"\nCould not extract shoreline for {shoreline_date} due to missing files.{e}"
                 )
                 continue
 
