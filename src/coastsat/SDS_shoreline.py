@@ -960,6 +960,13 @@ def extract_shorelines(
                     settings=settings,
                     collection=collection,
                 )
+            except SDS_preprocess.SkipImageError as e:
+                message = (
+                    f"{satname} {shoreline_date}: Skipped during preprocessing. {e}"
+                )
+                logger.warning(message)
+                print(f"\n{message}")
+                continue
             except FileNotFoundError as e:
                 logger.error(
                     f"Could not extract shoreline for {shoreline_date} due to missing files.{e}"

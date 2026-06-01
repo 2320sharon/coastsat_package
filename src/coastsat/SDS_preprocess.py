@@ -40,6 +40,10 @@ from coastsat import SDS_tools
 np.seterr(all="ignore")  # raise/ignore divisions by 0 and nans
 
 
+class SkipImageError(RuntimeError):
+    """Raised when preprocessing determines that an image must be skipped."""
+
+
 def preprocess_image(
     fn: Union[str, List[str]], satname: str, settings: Dict[str, Any], collection: str
 ) -> Tuple[np.ndarray, Any, np.ndarray, np.ndarray]:
@@ -832,16 +836,13 @@ def preprocess_single(
         # read s2cloudless cloud probability (last band in ms image)
         cloud_prob = data.GetRasterBand(data.RasterCount).ReadAsArray()
 
-        # image size
-        nrows = im_ms.shape[0]
-        ncols = im_ms.shape[1]
         # if image contains only zeros (can happen with S2), skip the image
         if sum(sum(sum(im_ms))) < 1:
-            im_ms = []
-            georef = []
-            # skip the image by giving it a full cloud_mask
-            cloud_mask = np.ones((nrows, ncols)).astype("bool")
-            return im_ms, georef, cloud_mask, [], [], []
+            # Raise a skip-specific exception so callers can continue the batch
+            # without receiving malformed placeholder arrays.
+            raise SkipImageError(
+                f"Skipped image because Sentinel-2 multispectral file contains only zeros: {fn_ms}"
+            )
 
         im_swir = read_bands(fn_swir)[0] / 10000  # TOA scaled to 10000
         im_swir = np.expand_dims(im_swir, axis=2)
@@ -1471,15 +1472,22 @@ def save_jpg(metadata, settings, **kwargs):
             fn = SDS_tools.get_filenames(filenames[i], filepath, satname)
             # read and preprocess image
             apply_cloud_mask = settings.get("apply_cloud_mask", True)
-            im_ms, georef, cloud_mask, im_extra, im_QA, im_nodata = preprocess_single(
-                fn,
-                satname,
-                settings["cloud_mask_issue"],
-                settings["pan_off"],
-                collection,
-                apply_cloud_mask,
-                s2cloudless_prob=s2cloudless_prob,
-            )
+            try:
+                im_ms, georef, cloud_mask, im_extra, im_QA, im_nodata = (
+                    preprocess_single(
+                        fn,
+                        satname,
+                        settings["cloud_mask_issue"],
+                        settings["pan_off"],
+                        collection,
+                        apply_cloud_mask,
+                        s2cloudless_prob=s2cloudless_prob,
+                    )
+                )
+            except SkipImageError as exc:
+                # Skip only the failing image and continue creating jpgs.
+                print(f"{satname}: {exc}")
+                continue
 
             # compute cloud_cover percentage (with no data pixels)
             cloud_cover_combined = np.divide(
@@ -1607,15 +1615,22 @@ def get_reference_sl(metadata, settings):
         # read image
         apply_cloud_mask = settings.get("apply_cloud_mask", True)
         fn = SDS_tools.get_filenames(filenames[i], filepath, satname)
-        im_ms, georef, cloud_mask, im_extra, im_QA, im_nodata = preprocess_single(
-            fn,
-            satname,
-            settings["cloud_mask_issue"],
-            settings["pan_off"],
-            collection,
-            apply_cloud_mask,
-            settings.get("s2cloudless_prob", 60),
-        )
+        try:
+            im_ms, georef, cloud_mask, im_extra, im_QA, im_nodata = (
+                preprocess_single(
+                    fn,
+                    satname,
+                    settings["cloud_mask_issue"],
+                    settings["pan_off"],
+                    collection,
+                    apply_cloud_mask,
+                    settings.get("s2cloudless_prob", 60),
+                )
+            )
+        except SkipImageError as exc:
+            # Skip only the failing image and continue scanning the reference set.
+            print(f"{satname}: {exc}")
+            continue
 
         # compute cloud_cover percentage (with no data pixels)
         cloud_cover_combined = np.divide(
