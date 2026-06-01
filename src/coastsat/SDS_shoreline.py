@@ -26,6 +26,7 @@ import sklearn
 from matplotlib import gridspec
 from pylab import ginput
 from shapely.geometry import LineString
+import skimage.draw as skdraw
 from skimage import filters, measure, morphology
 from shapely.geometry import LineString, Point
 from skimage.filters import threshold_multiotsu
@@ -1585,6 +1586,17 @@ def create_shoreline_buffer(im_shape, georef, image_epsg, pixel_size, settings):
         im_binary = np.zeros(im_shape)
         for j in range(len(ref_sl_pix_rounded)):
             im_binary[ref_sl_pix_rounded[j, 1], ref_sl_pix_rounded[j, 0]] = 1
+
+        for j in range(len(ref_sl_pix_rounded) - 1):
+            rr, cc = skdraw.line(
+                ref_sl_pix_rounded[j, 1],
+                ref_sl_pix_rounded[j, 0],
+                ref_sl_pix_rounded[j + 1, 1],
+                ref_sl_pix_rounded[j + 1, 0],
+            )
+            valid = (rr >= 0) & (rr < im_shape[0]) & (cc >= 0) & (cc < im_shape[1])
+            im_binary[rr[valid], cc[valid]] = 1
+
         im_binary = im_binary.astype(bool)
 
         # dilate the binary image to create a buffer around the reference shoreline
