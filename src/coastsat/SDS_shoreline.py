@@ -256,10 +256,19 @@ def compute_cloud_metrics(
         - cloud_cover: Fraction of cloud pixels over valid (non-no-data) pixels.
         - cloud_mask_adv: Advanced cloud mask where no-data pixels are excluded.
     """
+    cloud_mask = np.asarray(cloud_mask, dtype=bool)
+    im_nodata = np.asarray(im_nodata, dtype=bool)
+
     cloud_cover_combined = np.sum(cloud_mask) / cloud_mask.size
     # remove no data pixels from the cloud mask
     # (for example L7 bands of no data should not be accounted for)
-    cloud_mask_adv = np.logical_xor(cloud_mask, im_nodata)
+    try:
+        cloud_mask_adv = np.logical_xor(cloud_mask, im_nodata)
+    except ValueError as exc:
+        raise ValueError(
+            f"Cloud/no-data mask shape mismatch: cloud_mask {cloud_mask.shape}, "
+            f"im_nodata {im_nodata.shape}"
+        ) from exc
     valid_pixels = np.sum(~im_nodata)
 
     # compute updated cloud cover percentage (without no data pixels)
@@ -638,7 +647,9 @@ def get_finite_data(data) -> np.ndarray:
     valid_mask = np.isfinite(data)  # Create a mask of valid (non-NaN) values
     valid_data = data[valid_mask]  # Extract only the valid values
     if len(valid_data) == 0:
-        raise ValueError("no valid pixels found in reference shoreline buffer.")
+        raise ValueError(
+            "Not enough valid pixels found in reference shoreline buffer to extract a shoreline."
+        )
     return valid_data
 
 
@@ -960,21 +971,35 @@ def extract_shorelines(
                     settings=settings,
                     collection=collection,
                 )
+            except SDS_preprocess.SkipImageError as e:
+                message = (
+                    f"{satname} {shoreline_date}: Skipped during preprocessing. {e}"
+                )
+                logger.warning(message)
+                continue
             except FileNotFoundError as e:
                 logger.error(
                     f"Could not extract shoreline for {shoreline_date} due to missing files.{e}"
-                )
-                print(
-                    f"\nCould not extract shoreline for {shoreline_date} due to missing files.{e}"
                 )
                 continue
 
             # get image spatial reference system (epsg code) from metadata dict
             image_epsg = metadata[satname]["epsg"][i]
 
-            cloud_cover_combined, cloud_cover, cloud_mask_adv = compute_cloud_metrics(
-                cloud_mask=cloud_mask, im_nodata=im_nodata
-            )
+            try:
+                cloud_cover_combined, cloud_cover, cloud_mask_adv = (
+                    compute_cloud_metrics(cloud_mask=cloud_mask, im_nodata=im_nodata)
+                )
+            except ValueError as e:
+                logger.error(
+                    f"{satname} {shoreline_date}: Skipped due to invalid no-data mask. "
+                    f"Reason: {e}. Image file(s): {fn}"
+                )
+                print(
+                    f"\n{satname} {shoreline_date}: Skipped shoreline extraction due to invalid no-data mask ({e}). "
+                    f"Image file(s): {fn}"
+                )
+                continue
 
             if should_skip_image(
                 cloud_cover_combined=cloud_cover_combined,

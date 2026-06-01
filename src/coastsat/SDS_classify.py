@@ -128,21 +128,26 @@ def label_images(metadata, settings):
             fn = SDS_tools.get_filenames(filenames[i], filepath, satname)
             apply_cloud_mask = settings.get("apply_cloud_mask", True)
             # read and preprocess image
-            (
-                im_ms,
-                georef,
-                cloud_mask,
-                im_extra,
-                im_QA,
-                im_nodata,
-            ) = SDS_preprocess.preprocess_single(
-                fn,
-                satname,
-                settings["cloud_mask_issue"],
-                settings["pan_off"],
-                collection,
-                apply_cloud_mask,
-            )
+            try:
+                (
+                    im_ms,
+                    georef,
+                    cloud_mask,
+                    im_extra,
+                    im_QA,
+                    im_nodata,
+                ) = SDS_preprocess.preprocess_single(
+                    fn,
+                    satname,
+                    settings["cloud_mask_issue"],
+                    settings["pan_off"],
+                    collection,
+                    apply_cloud_mask,
+                )
+            except SDS_preprocess.SkipImageError as exc:
+                # Skip only the failing image and continue classifying later imagery.
+                print(f"{satname}: {exc}")
+                continue
 
             # compute cloud_cover percentage (with no data pixels)
             cloud_cover_combined = np.divide(
@@ -681,21 +686,26 @@ def evaluate_classifier(classifier, metadata, settings):
             fn = SDS_tools.get_filenames(filenames[i], filepath, satname)
             apply_cloud_mask = settings.get("apply_cloud_mask", True)
             # read and preprocess image
-            (
-                im_ms,
-                georef,
-                cloud_mask,
-                im_extra,
-                im_QA,
-                im_nodata,
-            ) = SDS_preprocess.preprocess_single(
-                fn,
-                satname,
-                settings["cloud_mask_issue"],
-                settings["pan_off"],
-                collection,
-                apply_cloud_mask,
-            )
+            try:
+                (
+                    im_ms,
+                    georef,
+                    cloud_mask,
+                    im_extra,
+                    im_QA,
+                    im_nodata,
+                ) = SDS_preprocess.preprocess_single(
+                    fn,
+                    satname,
+                    settings["cloud_mask_issue"],
+                    settings["pan_off"],
+                    collection,
+                    apply_cloud_mask,
+                )
+            except SDS_preprocess.SkipImageError as exc:
+                # Skip only the failing image and continue classifying later imagery.
+                print(f"{satname}: {exc}")
+                continue
             image_epsg = metadata[satname]["epsg"][i]
 
             # compute cloud_cover percentage (with no data pixels)
