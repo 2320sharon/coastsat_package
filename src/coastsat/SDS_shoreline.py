@@ -638,7 +638,9 @@ def get_finite_data(data) -> np.ndarray:
     valid_mask = np.isfinite(data)  # Create a mask of valid (non-NaN) values
     valid_data = data[valid_mask]  # Extract only the valid values
     if len(valid_data) == 0:
-        raise ValueError("no valid pixels found in reference shoreline buffer.")
+        raise ValueError(
+            "Not enough valid pixels found in reference shoreline buffer to extract a shoreline."
+        )
     return valid_data
 
 
