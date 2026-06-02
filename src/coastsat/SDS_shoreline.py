@@ -1437,18 +1437,21 @@ def find_wl_contours1(im_ndwi, cloud_mask, im_ref_buffer):
     nrows = cloud_mask.shape[0]
     ncols = cloud_mask.shape[1]
 
-    # create a buffer around the reference shoreline and reshape it into a vector
+    # create a buffer around the reference shoreline and reshape it into a vector eg. shape (nrows*ncols,)
     vec_buffer = im_ref_buffer.reshape(nrows * ncols)
 
-    # reshape spectral index image to vector
+    # reshape spectral index image to vector eg. shape (nrows*ncols,)
     vec_ndwi = im_ndwi.reshape(nrows * ncols)
-    # keep pixels that are in the buffer and not in the cloud mask
     vec_mask = cloud_mask.reshape(nrows * ncols)
+
+    # keep pixels that are in the buffer and not in the cloud mask
     vec = vec_ndwi[np.logical_and(vec_buffer, ~vec_mask)]
-    # apply otsu's threshold
     vec = vec[~np.isnan(vec)]
     if len(vec) == 0:
-        raise ValueError("no valid pixels found in reference shoreline buffer.")
+        raise ValueError(
+            "Not enough valid pixels found in reference shoreline buffer to extract a shoreline."
+        )
+    # apply otsu's thresholding method to find the optimal threshold separating water and land pixels
     t_otsu = filters.threshold_otsu(vec)
     # use Marching Squares algorithm to detect contours on ndwi image
     im_ndwi_buffer = np.copy(im_ndwi)
