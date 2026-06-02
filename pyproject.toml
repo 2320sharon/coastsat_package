@@ -12,9 +12,9 @@ where = ["src"]
 [project]
 name = "coastsat_package"
 dynamic = ["readme"]
-version = "0.4.6"
+version = "0.4.7"
 authors = [
-  { name="Sharon Fitzpatrick" },
+  { name="Sharon Batiste" },
 ]
 # find` directive with `include` or `exclude`
 description = "A packaged version of CoastSat: A Global shoreline mapping tool from satellite imagery"
