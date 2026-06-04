@@ -1,0 +1,30 @@
+name: Test pixi install
+
+# Verifies that coastsat_package installs from source with pixi on every
+# supported OS, then imports cleanly. Complements the conda-based test workflow.
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  pixi-install:
+    name: pixi install on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pixi and install the environment
+        uses: prefix-dev/setup-pixi@v0.8
+        with:
+          locked: true   # fail if pixi.lock is out of sync with pyproject.toml
+          cache: true
+
+      - name: Import smoke test
+        run: pixi run smoke-test

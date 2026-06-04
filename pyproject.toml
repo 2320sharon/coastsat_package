@@ -42,3 +42,34 @@ classifiers = [
 [project.urls]
 "Homepage" = "https://github.com/SatelliteShorelines/coastsat_package"
 "Bug Tracker" = "https://github.com/SatelliteShorelines/coastsat_package/issues"
+
+# --- pixi configuration ---------------------------------------------------
+# Makes this repo a pixi project so `pixi install` builds a working coastsat
+# environment from source. The geospatial stack is pulled from conda-forge
+# (reliable cross-platform binaries) while the project itself is installed as
+# an editable PyPI path dependency. CI verifies this on Linux/macOS/Windows.
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64", "win-64"]
+
+[tool.pixi.pypi-dependencies]
+coastsat-package = { path = ".", editable = true }
+
+[tool.pixi.dependencies]
+python = ">=3.10,<3.14"
+geopandas = "*"
+gdal = "*"
+scikit-image = "*"
+scikit-learn = "*"
+scipy = "*"
+numpy = "*"
+matplotlib = "*"
+imageio = "*"
+astropy = "*"
+tqdm = "*"
+pyqt = "*"            # conda name for the pyqt5 PyPI dependency
+jupyterlab = ">=3.0.0"
+earthengine-api = ">=0.1.304"
+
+[tool.pixi.tasks]
+smoke-test = "python -c \"import coastsat; print('coastsat OK:', coastsat.__file__)\""
