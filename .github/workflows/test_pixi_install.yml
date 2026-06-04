@@ -20,11 +20,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up pixi and install the environment
+      - name: Set up pixi and install the default + test environments
         uses: prefix-dev/setup-pixi@v0.8
         with:
+          environments: |
+            default
+            test
           locked: true   # fail if pixi.lock is out of sync with pyproject.toml
           cache: true
 
-      - name: Import smoke test
-        run: pixi run smoke-test
+      - name: Import smoke test (default environment — pytest absent)
+        run: pixi run -e default smoke-test
+
+      - name: Run credential-free unit tests (test environment)
+        run: pixi run -e test test
