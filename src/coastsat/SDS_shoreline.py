@@ -26,6 +26,7 @@ import sklearn
 from matplotlib import gridspec
 from pylab import ginput
 from shapely.geometry import LineString
+import skimage.draw as skdraw
 from skimage import filters, measure, morphology
 from shapely.geometry import LineString, Point
 from skimage.filters import threshold_multiotsu
@@ -1437,18 +1438,21 @@ def find_wl_contours1(im_ndwi, cloud_mask, im_ref_buffer):
     nrows = cloud_mask.shape[0]
     ncols = cloud_mask.shape[1]
 
-    # create a buffer around the reference shoreline and reshape it into a vector
+    # create a buffer around the reference shoreline and reshape it into a vector eg. shape (nrows*ncols,)
     vec_buffer = im_ref_buffer.reshape(nrows * ncols)
 
-    # reshape spectral index image to vector
+    # reshape spectral index image to vector eg. shape (nrows*ncols,)
     vec_ndwi = im_ndwi.reshape(nrows * ncols)
-    # keep pixels that are in the buffer and not in the cloud mask
     vec_mask = cloud_mask.reshape(nrows * ncols)
+
+    # keep pixels that are in the buffer and not in the cloud mask
     vec = vec_ndwi[np.logical_and(vec_buffer, ~vec_mask)]
-    # apply otsu's threshold
     vec = vec[~np.isnan(vec)]
     if len(vec) == 0:
-        raise ValueError("no valid pixels found in reference shoreline buffer.")
+        raise ValueError(
+            "Not enough valid pixels found in reference shoreline buffer to extract a shoreline."
+        )
+    # apply otsu's thresholding method to find the optimal threshold separating water and land pixels
     t_otsu = filters.threshold_otsu(vec)
     # use Marching Squares algorithm to detect contours on ndwi image
     im_ndwi_buffer = np.copy(im_ndwi)
@@ -1553,6 +1557,42 @@ def find_wl_contours2(im_ms, im_labels, cloud_mask, im_ref_buffer):
 ###################################################################################################
 
 
+def densify_line_coords(coords: np.array, max_spacing: float) -> np.array:
+    """
+    Densify a 2D LineString so no segment is longer than max_spacing.
+    coords must be in a projected CRS where units are meters.
+
+    Example: Make a sparse line segment consisting of two points 100m apart into a line segment with points every 10m.
+    The Linestring looks the same but has more points
+
+    Arguments:
+    coords: np.array
+        array of shape (n, 2) containing the coordinates of the line to be densified
+    max_spacing: float
+         maximum allowed spacing between points in the output coordinates
+
+    Returns:
+    np.array
+        array of shape (m, 2) containing the densified coordinates
+    """
+    line = LineString(coords)
+
+    if line.is_empty or line.length == 0:
+        return coords
+
+    # Shapely >= 2.0
+    if hasattr(line, "segmentize"):
+        return np.asarray(line.segmentize(max_spacing).coords)
+
+    # Fallback for older Shapely
+    distances = np.arange(0, line.length, max_spacing)
+    if len(distances) == 0 or distances[-1] < line.length:
+        distances = np.append(distances, line.length)
+
+    pts = [line.interpolate(d) for d in distances]
+    return np.array([[p.x, p.y] for p in pts])
+
+
 def create_shoreline_buffer(im_shape, georef, image_epsg, pixel_size, settings):
     """
     Creates a buffer around the reference shoreline. The size of the buffer is
@@ -1588,34 +1628,42 @@ def create_shoreline_buffer(im_shape, georef, image_epsg, pixel_size, settings):
     im_buffer = np.ones(im_shape).astype(bool)
 
     if "reference_shoreline" in settings.keys():
-        # convert reference shoreline to pixel coordinates
-        ref_sl = settings["reference_shoreline"]
+        ref_sl = settings["reference_shoreline"][:, :2]
+
+        # Convert reference shoreline to the image CRS first
         ref_sl_conv = SDS_tools.convert_epsg(
             ref_sl, settings["output_epsg"], image_epsg
-        )[:, :-1]
+        )[:, :2]
+
+        # Densify before converting to pixels.
+        # Use half a pixel so the reference line is safely sampled.
+        densify_spacing = settings.get("ref_sl_densify_spacing", pixel_size / 2)
+        ref_sl_conv = densify_line_coords(ref_sl_conv, densify_spacing)
+
+        # Convert dense line to pixel coordinates
         ref_sl_pix = SDS_tools.convert_world2pix(ref_sl_conv, georef)
         ref_sl_pix_rounded = np.round(ref_sl_pix).astype(int)
 
-        # make sure that the pixel coordinates of the reference shoreline are inside the image
-        idx_row = np.logical_and(
-            ref_sl_pix_rounded[:, 0] > 0, ref_sl_pix_rounded[:, 0] < im_shape[1]
-        )
-        idx_col = np.logical_and(
-            ref_sl_pix_rounded[:, 1] > 0, ref_sl_pix_rounded[:, 1] < im_shape[0]
-        )
-        idx_inside = np.logical_and(idx_row, idx_col)
-        ref_sl_pix_rounded = ref_sl_pix_rounded[idx_inside, :]
+        # Rasterize the dense line
+        im_binary = np.zeros(im_shape, dtype=bool)
 
-        # create binary image of the reference shoreline (1 where the shoreline is 0 otherwise)
-        im_binary = np.zeros(im_shape)
-        for j in range(len(ref_sl_pix_rounded)):
-            im_binary[ref_sl_pix_rounded[j, 1], ref_sl_pix_rounded[j, 0]] = 1
-        im_binary = im_binary.astype(bool)
+        for j in range(len(ref_sl_pix_rounded) - 1):
+            rr, cc = skdraw.line(
+                ref_sl_pix_rounded[j, 1],
+                ref_sl_pix_rounded[j, 0],
+                ref_sl_pix_rounded[j + 1, 1],
+                ref_sl_pix_rounded[j + 1, 0],
+            )
 
-        # dilate the binary image to create a buffer around the reference shoreline
-        max_dist_ref_pixels = np.ceil(settings["max_dist_ref"] / pixel_size)
-        se = morphology.disk(max_dist_ref_pixels)
-        im_buffer = morphology.binary_dilation(im_binary, se)
+            # Clip line pixels to image bounds
+            valid = (rr >= 0) & (rr < im_shape[0]) & (cc >= 0) & (cc < im_shape[1])
+
+            im_binary[rr[valid], cc[valid]] = True
+
+    # Dilate the binary reference line to create the buffer
+    max_dist_ref_pixels = int(np.ceil(settings["max_dist_ref"] / pixel_size))
+    se = morphology.disk(max_dist_ref_pixels)
+    im_buffer = morphology.binary_dilation(im_binary, se)
 
     return im_buffer
 
