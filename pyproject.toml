@@ -12,7 +12,7 @@ where = ["src"]
 [project]
 name = "coastsat_package"
 dynamic = ["readme"]
-version = "0.4.6"
+version = "0.4.7"
 authors = [
   { name="Sharon Fitzpatrick" },
 ]
@@ -30,9 +30,18 @@ dependencies = [ "scikit-image",
   "scipy",
   "numpy",
   "imageio",
-  "scikit-learn"]
+  "scikit-learn",
+  "shapely",       
+  "pandas",         
+  "joblib",         
+  "pytz",           
+  "requests",       
+  "google-auth"]    
+  # NOTE: gdal (osgeo) is also imported but intentionally NOT listed here — the GDAL
+  # wheel needs system libraries and routinely fails to pip-install. It is supplied by
+  # conda (see README) and by the conda-forge feedstock recipe.
 license = { file="LICENSE" }
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -74,6 +83,8 @@ earthengine-api = ">=0.1.304"
 [tool.pixi.tasks]
 smoke-test = "python -c \"import coastsat; print('coastsat OK:', coastsat.__file__)\""
 
+# Run the pytest-based test suite with the command: pixi run -e test test
+
 # Testing tooling lives in its own feature/environment so the default (shipping)
 # environment stays pytest-free.
 [tool.pixi.feature.test.dependencies]
@@ -89,10 +100,3 @@ test = "pytest tests/ -v"
 default = { solve-group = "default" }
 test = { features = ["test"], solve-group = "default" }
 
-[tool.pytest.ini_options]
-# Excluded from collection so the credential-free run stays green:
-#  - test_cloud_coverage.py: a Google Earth Engine + data integration script that
-#    runs network/data code at import time (not a unit test).
-#  - test_s2_band_selection.py: imports append_s2cloudless_band, which is not yet
-#    implemented in SDS_download.py (work in progress). Re-enable once it exists.
-addopts = "--ignore=tests/test_cloud_coverage.py --ignore=tests/test_s2_band_selection.py"

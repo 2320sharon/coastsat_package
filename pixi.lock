@@ -4515,8 +4515,8 @@ packages:
   timestamp: 1765303462831
 - pypi: ./
   name: coastsat-package
-  version: 0.4.6
-  sha256: ef72fa273e905005c406b94580dc9dffe9f903ef111f18970c2a7d1dafa8728f
+  version: 0.4.7
+  sha256: f8808dff7843ae90c8507b8478e8daf97e52ff44f8eefc94e8079dcadc920653
   requires_dist:
   - scikit-image
   - earthengine-api>=0.1.304
@@ -4531,7 +4531,13 @@ packages:
   - numpy
   - imageio
   - scikit-learn
-  requires_python: '>=3.8'
+  - shapely
+  - pandas
+  - joblib
+  - pytz
+  - requests
+  - google-auth
+  requires_python: '>=3.10'
   editable: true
 - conda: https://conda.anaconda.org/conda-forge/noarch/colorama-0.4.6-pyhd8ed1ab_1.conda
   sha256: ab29d57dc70786c1269633ba3dff20288b81664d3ff8d21af995742e2bb03287
