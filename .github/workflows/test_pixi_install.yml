@@ -4,9 +4,9 @@ name: Test pixi install
 # supported OS, then imports cleanly. Complements the conda-based test workflow.
 on:
   push:
-    branches: [master]
+    branches: [add_gh_action]
   pull_request:
-    branches: [master]
+    branches: [add_gh_action]
   workflow_dispatch:
 
 jobs:
