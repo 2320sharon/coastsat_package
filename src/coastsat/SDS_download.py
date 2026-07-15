@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple, Union, Optional
 import zipfile
 import functools
+from concurrent.futures import ThreadPoolExecutor
 
 
 # Third-party imports
@@ -264,6 +265,156 @@ def record_skip_cache_entry(
         "reason": metrics.get("reason", "cloud_nodata"),
         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# Base GTiff creation options for the .tif files this module rewrites.
+# Earth Engine already returns DEFLATE-compressed, tiled, band-interleaved
+# GeoTIFFs, but GDAL's GTiff driver defaults to no compression, so every band
+# merge (gdal.Translate) and resample (gdal.Warp) wrote the data back out
+# uncompressed. All options here are lossless.
+# ZLEVEL=6 is GDAL's default; it is set explicitly to pin it.
+DEFLATE_BASE_OPTIONS = ["COMPRESS=DEFLATE", "ZLEVEL=6", "TILED=YES", "INTERLEAVE=BAND"]
+
+# Suffixes for the scratch files written while trying each predictor. Neither
+# ends in .tif, so a stray temp can never be picked up by the *.tif globs used
+# to find imagery downstream.
+_TMP_SUFFIX = ".deflate.tmp"
+_BEST_SUFFIX = ".deflate.best"
+
+
+def get_predictor_candidates(dtype: int) -> List[Optional[int]]:
+    """
+    Return the DEFLATE predictors worth trying for a band of this GDAL data type.
+
+    None means "no PREDICTOR option". PREDICTOR=3 is float-only (GDAL rejects it
+    outright for integer rasters) so it is only offered for float bands. No single
+    predictor wins on all of this imagery, so callers trial-compress with each
+    candidate and keep whichever produces the smallest file.
+
+    Arguments:
+    -----------
+    dtype: int
+        GDAL data type of the band (e.g. gdal.GDT_UInt16)
+
+    Returns:
+    -----------
+    list: predictor values to try, None meaning no predictor
+
+    """
+    if dtype in (gdal.GDT_Float32, gdal.GDT_Float64):
+        return [None, 2, 3]
+    return [None, 2]
+
+
+def build_deflate_options(predictor: Optional[int]) -> List[str]:
+    """
+    Return the GTiff creation options for DEFLATE with the given predictor.
+
+    Arguments:
+    -----------
+    predictor: int or None
+        PREDICTOR value to use, or None to omit the option
+
+    Returns:
+    -----------
+    list: creation options for gdal.Translate
+
+    """
+    options = list(DEFLATE_BASE_OPTIONS)
+    if predictor is not None:
+        options.append("PREDICTOR=%d" % predictor)
+    return options
+
+
+def _remove_if_exists(fn: str) -> None:
+    """Delete a file and any GDAL .aux.xml sidecar, ignoring failures."""
+    for path in (fn, fn + ".aux.xml"):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def compress_tif_in_place(fn: str, logger: logging.Logger = None) -> bool:
+    """
+    Rewrite a .tif as a DEFLATE-compressed GeoTIFF, picking whichever predictor
+    compresses that particular file smallest.
+
+    Intended to run on a background thread once the download loop has finished
+    reading the file, so the compression never delays the next download.
+
+    This is best-effort: on any failure the original file is left untouched, so a
+    compression problem can never break a download run. Images that Earth Engine
+    already returned compressed are left alone, because repacking them makes them
+    larger.
+
+    Arguments:
+    -----------
+    fn: str
+        filepath of the .tif to compress in place
+    logger: logging.Logger
+        optional logger for reporting failures
+
+    Returns:
+    -----------
+    bool: True if the file was rewritten, False if it was skipped or failed
+
+    """
+    tmp_fn = fn + _TMP_SUFFIX
+    best_fn = fn + _BEST_SUFFIX
+    try:
+        # the cloud/no-data filter deletes images, so the file may be gone
+        if not os.path.exists(fn):
+            return False
+
+        image = gdal.Open(fn, gdal.GA_ReadOnly)
+        if image is None:
+            return False
+        dtype = image.GetRasterBand(1).DataType
+        already_compressed = image.GetMetadata("IMAGE_STRUCTURE").get("COMPRESSION")
+        image = None
+        # Earth Engine returns single-band downloads already DEFLATE-compressed
+        if already_compressed:
+            return False
+
+        # seed with the original size so a file no candidate improves is left alone
+        best_size = os.path.getsize(fn)
+        found_smaller = False
+        for predictor in get_predictor_candidates(dtype):
+            # gdal infers the driver from the extension, which .tmp does not resolve
+            out = gdal.Translate(
+                tmp_fn,
+                fn,
+                format="GTiff",
+                creationOptions=build_deflate_options(predictor),
+            )
+            # errors are routed to CPLQuietErrorHandler, so a failure arrives as None
+            if out is None:
+                _remove_if_exists(tmp_fn)
+                continue
+            out = None
+            size = os.path.getsize(tmp_fn)
+            if size < best_size:
+                best_size = size
+                found_smaller = True
+                _remove_if_exists(best_fn)
+                os.replace(tmp_fn, best_fn)
+            else:
+                _remove_if_exists(tmp_fn)
+
+        if not found_smaller:
+            return False
+        os.replace(best_fn, fn)
+        _remove_if_exists(fn + ".aux.xml")
+        return True
+    except Exception as e:
+        if logger is not None:
+            logger.warning(f"Could not compress {fn}, leaving it uncompressed.\n{e}")
+        return False
+    finally:
+        _remove_if_exists(tmp_fn)
+        _remove_if_exists(best_fn)
 
 
 def get_metadata_combined(inputs: Dict[str, Any]) -> Dict[str, Dict[str, list]]:
@@ -1901,6 +2052,12 @@ def retrieve_images(
             f"Removed {removed_cache_entries} stale skip-cache entries for current thresholds."
         )
 
+    # compress the downloaded tifs on a background thread so that the compression
+    # never holds up the next download. One worker keeps up easily: compressing an
+    # image takes tens of milliseconds against a multi-second download.
+    compress_tifs = inputs.get("compress_tifs", True)
+    compressor = ThreadPoolExecutor(max_workers=1) if compress_tifs else None
+
     if np.all([len(im_dict_T1[satname]) == 0 for satname in im_dict_T1.keys()]):
         print(
             f"{inputs['sitename']}: No images to download for {sat_list} during {dates} for {cloud_threshold}% cloud cover"
@@ -1934,6 +2091,9 @@ def retrieve_images(
             for i in pbar:
                 try:
                     skip_image = False
+                    # final .tif files kept for this image, queued for compression
+                    # once every step below has finished reading them
+                    final_tifs = []
                     # initalize the variables
                     # filepath (fp) for the multispectural file
                     fp_ms = ""
@@ -2127,6 +2287,7 @@ def retrieve_images(
                             os.remove(original_file)
 
                         fn = [filepath_ms, filepath_QA]
+                        final_tifs = fn
                         filter_metrics = (
                             SDS_preprocess.filter_images_by_cloud_cover_nodata(
                                 fn,
@@ -2285,6 +2446,7 @@ def retrieve_images(
 
                         filepath_pan = os.path.join(fp_pan, im_fn["pan"])
                         fn = [filepath_ms, filepath_pan, filepath_QA]
+                        final_tifs = fn
                         filter_metrics = (
                             SDS_preprocess.filter_images_by_cloud_cover_nodata(
                                 fn,
@@ -2471,6 +2633,7 @@ def retrieve_images(
                             os.rename(fn_ms, dst)
 
                         fn = [filepath_ms, filepath_swir, filepath_QA]
+                        final_tifs = fn
 
                         # Removes images whose cloud cover and no data coverage exceeds the threshold
                         filter_metrics = (
@@ -2547,7 +2710,16 @@ def retrieve_images(
                     finally:
                         processed_images_since_flush += 1 # increment the counter for processed images
                         flush_skip_cache_if_needed()
+                        # queue the kept images for compression now that the cloud
+                        # filter, the jpg and the metadata have all read them.
+                        # Images dropped by the filter are never compressed.
+                        if compressor is not None and not skip_image:
+                            for fn_tif in final_tifs:
+                                compressor.submit(compress_tif_in_place, fn_tif, logger)
 
+    if compressor is not None:
+        # wait for the queued compressions to finish before reading the files back
+        compressor.shutdown(wait=True)
     flush_skip_cache_if_needed(force=True)
     save_skip_cache(inputs, skip_cache)
     # combines all the metadata into a single dictionary and saves it to json

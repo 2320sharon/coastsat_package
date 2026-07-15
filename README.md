@@ -182,6 +182,10 @@ To retrieve from the GEE server the available satellite images cropped around th
 - `filepath`: filepath to the directory where the data will be stored
 - :new: `landsat_collection`: whether to use Collection 1 (`C01`) or Collection 2 (`C02`). Note that after 2022/01/01, Landsat images are only available in Collection 2. Landsat 9 is therefore only available as Collection 2. So if the user has selected `C01`, images prior to 2022/01/01 will be downloaded from Collection 1, while images captured after that date will be automatically taken from `C02`. Also note that at the time of writing `C02` is not complete in Google Earth Engine and still being uploaded.
 
+The following variable is optional:
+
+- :new: `compress_tifs`: whether to save the downloaded .TIF files DEFLATE-compressed (defaults to `True`). This is lossless, typically halves the size of the downloaded imagery, and is done on a background thread so it does not slow the downloads down. Set to `False` to write the images uncompressed.
+
 The call `metadata = SDS_download.retrieve_images(inputs)` will launch the retrieval of the images and store them as .TIF files (under _/filepath/sitename_). The metadata contains the exact time of acquisition (in UTC time) of each image, its projection and its geometric accuracy. If the images have already been downloaded previously and the user only wants to run the shoreline detection, the metadata can be loaded directly by running `metadata = SDS_download.get_metadata(inputs)`.
 
 The screenshot below shows an example of inputs that will retrieve all the images of Collaroy-Narrabeen (Australia) acquired by Sentinel-2 in December 2017.
