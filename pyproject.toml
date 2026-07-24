@@ -42,3 +42,8 @@ classifiers = [
 [project.urls]
 "Homepage" = "https://github.com/SatelliteShorelines/coastsat_package"
 "Bug Tracker" = "https://github.com/SatelliteShorelines/coastsat_package/issues"
+
+[tool.pytest.ini_options]
+markers = [
+    "perf: timing-sensitive benchmark; deselect with -m 'not perf'",
+]

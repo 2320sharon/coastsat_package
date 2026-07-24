@@ -232,11 +232,17 @@ def compute_intersection(output, transects, settings):
             Mrot = np.array([[np.cos(phi), np.sin(phi)], [-np.sin(phi), np.cos(phi)]])
 
             # calculate point to line distance between shoreline points and the transect
+            # |(p2-p1) x (sl-p1)| / |p2-p1|. np.cross on 2D vectors is deprecated in
+            # NumPy 2.0, so the z-component of the cross product is written out explicitly.
             p1 = np.array([X0, Y0])
             p2 = transects[key][-1, :]
-            d_line = np.abs(np.cross(p2 - p1, sl - p1) / np.linalg.norm(p2 - p1))
+            vec = p2 - p1
+            w = sl - p1
+            d_line = np.abs(
+                (vec[0] * w[:, 1] - vec[1] * w[:, 0]) / np.linalg.norm(vec)
+            )
             # calculate the distance between shoreline points and the origin of the transect
-            d_origin = np.array([np.linalg.norm(sl[k, :] - p1) for k in range(len(sl))])
+            d_origin = np.linalg.norm(w, axis=1)
             # find the shoreline points that are close to the transects and to the origin
             # the distance to the origin is hard-coded here to 1 km
             idx_dist = np.logical_and(
@@ -244,9 +250,7 @@ def compute_intersection(output, transects, settings):
             )
             # find the shoreline points that are in the direction of the transect (within 90 degrees)
             temp_sl = sl - np.array(transects[key][0, :])
-            phi_sl = np.array(
-                [np.arctan2(temp_sl[k, 1], temp_sl[k, 0]) for k in range(len(temp_sl))]
-            )
+            phi_sl = np.arctan2(temp_sl[:, 1], temp_sl[:, 0])
             diff_angle = phi - phi_sl
             idx_angle = np.abs(diff_angle) < np.pi / 2
             # combine the transects that are close in distance and close in orientation
@@ -334,12 +338,22 @@ def compute_intersection_QC(output, transects, settings, use_progress_bar: bool 
         min_intersect = np.zeros(len(shorelines))
         n_intersect = np.zeros(len(shorelines))
 
+        # the transect geometry does not depend on the shoreline -> compute it once
+        X0 = transects[key][0, 0]
+        Y0 = transects[key][0, 1]
+        p1 = np.array([X0, Y0])
+        p2 = transects[key][-1, :]
+        vec = p2 - p1
+        vec_norm = np.linalg.norm(vec)
+        phi = np.arctan2(vec[1], vec[0])
+        Mrot = np.array([[np.cos(phi), np.sin(phi)], [-np.sin(phi), np.cos(phi)]])
+
         # loop through each shoreline
         for i in range(len(shorelines)):
             sl = shorelines[i]
 
-            # in case there are no shoreline points
-            if len(sl) == 0:
+            # in case there are no shoreline points, or the transect has zero length
+            if len(sl) == 0 or vec_norm == 0:
                 std_intersect[i] = np.nan
                 med_intersect[i] = np.nan
                 max_intersect[i] = np.nan
@@ -347,23 +361,27 @@ def compute_intersection_QC(output, transects, settings, use_progress_bar: bool 
                 n_intersect[i] = np.nan
                 continue
 
-            # compute rotation matrix
-            X0 = transects[key][0, 0]
-            Y0 = transects[key][0, 1]
-            temp = np.array(transects[key][-1, :]) - np.array(transects[key][0, :])
-            phi = np.arctan2(temp[1], temp[0])
-            Mrot = np.array([[np.cos(phi), np.sin(phi)], [-np.sin(phi), np.cos(phi)]])
+            # distance between the shoreline points and the origin of the transect,
+            # hard-coded to 1 km as before. This was a per-point Python loop and is what
+            # made the function slow. Non-finite coordinates give a non-finite distance,
+            # which fails `<= 1000` and drops out on its own while the remaining points
+            # are still processed -- the same way the original behaved.
+            d_origin = np.linalg.norm(sl - p1, axis=1)
+            cand = np.where(d_origin <= 1000)[0]
+            if len(cand) == 0:
+                std_intersect[i] = np.nan
+                med_intersect[i] = np.nan
+                max_intersect[i] = np.nan
+                min_intersect[i] = np.nan
+                n_intersect[i] = np.nan
+                continue
 
-            # calculate point to line distance between shoreline points and the transect
-            p1 = np.array([X0, Y0])
-            p2 = transects[key][-1, :]
-            d_line = np.abs(np.cross(p2 - p1, sl - p1) / np.linalg.norm(p2 - p1))
-            # calculate the distance between shoreline points and the origin of the transect
-            d_origin = np.array([np.linalg.norm(sl[k, :] - p1) for k in range(len(sl))])
-            # find the shoreline points that are close to the transects and to the origin
-            # the distance to the origin is hard-coded here to 1 km
-            idx_dist = np.logical_and(d_line <= along_dist, d_origin <= 1000)
-            idx_close = np.where(idx_dist)[0]
+            # point to line distance |(p2-p1) x (sl-p1)| / |p2-p1|, evaluated only on the
+            # candidates. np.cross on 2D vectors is deprecated in NumPy 2.0, so the
+            # z-component of the cross product is written out explicitly.
+            w = sl[cand] - p1
+            d_line = np.abs((vec[0] * w[:, 1] - vec[1] * w[:, 0]) / vec_norm)
+            idx_close = cand[d_line <= along_dist]
 
             # in case there are no shoreline points close to the transect
             if len(idx_close) == 0:
