@@ -75,7 +75,14 @@ def preprocess_image(
     apply_cloud_mask = settings.get("apply_cloud_mask", True)
 
     if satname == "S1":
-        im_ms, georef = SDS_tools.read_sar_image(fn[0])
+        # one file per polarization, stacked into one channel each
+        im_ms, georef = SDS_tools.read_sar_image(fn)
+        # when both polarizations are present, work on the [VV, VH, VV-VH] composite
+        im_composite = SDS_tools.build_sar_composite(
+            im_ms, [SDS_tools.get_polarization_from_filename(f) for f in fn]
+        )
+        if im_composite is not None:
+            im_ms = im_composite
         im_nodata = np.zeros(im_ms.shape[:2], dtype=bool)
         cloud_mask = np.zeros(im_ms.shape[:2], dtype=bool)
         return im_ms, georef, cloud_mask, im_nodata
@@ -272,7 +279,7 @@ def remove_files_above_threshold(
     """
     if prc > threshold:
         print(
-            f"skipping image '{os.path.basename(filepaths[0])}' {msg} {prc*100:.2f}% exceeds threshold of {threshold*100:.2f}%"
+            f"skipping image '{os.path.basename(filepaths[0])}' {msg} {prc * 100:.2f}% exceeds threshold of {threshold * 100:.2f}%"
         )
         # delete files that exceed the cloud cover threshold
         for file in filepaths:
@@ -873,7 +880,9 @@ def preprocess_single(
             # add zeros to im nodata
             im_nodata = np.logical_or(im_zeros, im_nodata)
             if "merged" in fn_ms:
-                im_nodata = morphology.dilation(im_nodata, morphology.square(5))
+                im_nodata = morphology.dilation(
+                    im_nodata, SDS_tools.footprint_square(5)
+                )
             # update cloud mask with all the nodata pixels
             # v0.1.40 change : might be bug
             cloud_mask = np.logical_or(cloud_mask, im_nodata)
@@ -899,7 +908,9 @@ def preprocess_single(
             # update cloud mask with all the nodata pixels
             cloud_mask = np.logical_or(cloud_mask, im_nodata)
             if "merged" in fn_ms:
-                im_nodata = morphology.dilation(im_nodata, morphology.square(5))
+                im_nodata = morphology.dilation(
+                    im_nodata, SDS_tools.footprint_square(5)
+                )
             # move cloud mask to above if statement to avoid bug in v0.1.40
 
         # no extra image
@@ -978,8 +989,8 @@ def create_cloud_mask(im_QA, satname, cloud_mask_issue, collection):
         cloud_mask = np.zeros_like(im_QA, dtype=bool)
         for value in cloud_values:
             cloud_mask_temp = np.isin(im_QA, value)
-            elem = morphology.square(6)  # use a square of width 6 pixels
-            cloud_mask_temp = morphology.binary_opening(
+            elem = SDS_tools.footprint_square(6)  # use a square of width 6 pixels
+            cloud_mask_temp = SDS_tools.binary_opening(
                 cloud_mask_temp, elem
             )  # perform image opening
             cloud_mask_temp = morphology.remove_small_objects(
@@ -1013,8 +1024,8 @@ def create_s2cloudless_mask(cloud_prob, s2cloudless_prob=60):
     # find which pixels have bits corresponding to cloud values
     cloud_mask = cloud_prob > s2cloudless_prob
     # dilate cloud mask
-    elem = morphology.square(6)  # use a square of width 6 pixels
-    cloud_mask = morphology.binary_opening(cloud_mask, elem)  # perform image opening
+    elem = SDS_tools.footprint_square(6)  # use a square of width 6 pixels
+    cloud_mask = SDS_tools.binary_opening(cloud_mask, elem)  # perform image opening
 
     return cloud_mask
 
@@ -1184,36 +1195,88 @@ def save_sar_image(
     quality: int = 100,
 ) -> None:
     """
-    Saves a single-band SAR image (e.g., Sentinel-1) as a JPEG file.
+    Saves a SAR image (e.g., Sentinel-1) as a titled JPEG figure.
 
-    The image is assumed to be stored in the first band of a 3D array (im_ms[:, :, 0]).
-    Intensity values are rescaled from the SAR-specific range of [-45, 5] dB to [0, 1],
-    then saved as an 8-bit JPEG in the RGB output folder.
+    For a dual-polarization scene im_ms is the [VV, VH, VV-VH] composite and the
+    preview is that composite as a false-colour RGB, one polarization per channel.
+    A scene with a single polarization is shown as greyscale instead.
+
+    Each band is stretched on its own 2nd-98th percentiles: the three bands cover
+    very different dB ranges, so a shared stretch would saturate VV-VH.
 
     Args:
-        im_ms (np.ndarray): 3D array where the SAR image is in the first band.
+        im_ms (np.ndarray): 3D array with one band per composite band.
         date (str): Acquisition date string used in the filename.
         satname (str): Name of the satellite (e.g., 'S1').
         root_dir (str): Base directory where the image will be saved.
-        quality (int, optional): JPEG quality level (default is 100).
+        quality (int, optional): unused, kept for call compatibility.
 
     Returns:
         None
     """
-    if im_ms.ndim == 2:
-        im = im_ms  # already 2D
-    elif im_ms.ndim == 3:
-        im = im_ms[:, :, 0]  # first band
-    else:
+    if im_ms.ndim not in (2, 3):
         raise ValueError(f"Unexpected shape for SAR input: {im_ms.shape}")
-    im_rescaled = exposure.rescale_intensity(im, in_range=(-45, 5), out_range=(0, 1))
-    im_uint8 = img_as_ubyte(im_rescaled)
+
+    im_display, title = build_sar_preview(im_ms, date, satname)
 
     rgb_dir = os.path.join(root_dir, "RGB")
     os.makedirs(rgb_dir, exist_ok=True)
 
-    filename = f"{date}_RGB_{satname}.jpg"
-    imageio.imwrite(os.path.join(rgb_dir, filename), im_uint8, quality=quality)
+    plt.ioff()
+    height, width = im_display.shape[:2]
+    # keep the figure roughly the aspect ratio of the image, with room for the title
+    fig, ax = plt.subplots(figsize=(8, 8 * height / max(width, 1) + 0.6))
+    ax.imshow(im_display, cmap=None if im_display.ndim == 3 else "gray")
+    ax.set_title(title, fontsize=10)
+    ax.axis("off")
+    fig.savefig(
+        os.path.join(rgb_dir, f"{date}_RGB_{satname}.jpg"),
+        dpi=150,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+def build_sar_preview(im_ms, date, satname):
+    """
+    Builds the displayable SAR preview image and its title.
+
+    Args:
+        im_ms (np.ndarray): 2D band, or 3D array of composite/polarization bands.
+        date (str): Acquisition date string.
+        satname (str): Name of the satellite (e.g., 'S1').
+
+    Returns:
+        tuple: (np.ndarray to display, str title). The array is an (H, W, 3) RGB for
+        a full composite, or (H, W) greyscale otherwise.
+    """
+    bands = SDS_tools.SAR_COMPOSITE_BANDS
+
+    if im_ms.ndim == 3 and im_ms.shape[2] >= len(bands):
+        im_display = np.dstack(
+            [_stretch_sar_band(im_ms[:, :, k]) for k in range(len(bands))]
+        )
+        channels = ", ".join(f"{channel}={band}" for channel, band in zip("RGB", bands))
+        title = (
+            f"{date} {satname} - composite of the {'/'.join(bands)} bands ({channels})"
+        )
+    else:
+        band = im_ms if im_ms.ndim == 2 else im_ms[:, :, 0]
+        im_display = _stretch_sar_band(band)
+        title = f"{date} {satname}"
+
+    return im_display, title
+
+
+def _stretch_sar_band(band):
+    """Rescales one SAR band to [0, 1] on its own 2nd-98th percentiles."""
+    band = np.nan_to_num(band, nan=0.0, posinf=0.0, neginf=0.0)
+    low, high = np.percentile(band, [2, 98])
+    if high <= low:
+        return np.zeros_like(band, dtype="float64")
+    return exposure.rescale_intensity(
+        band.astype("float64"), in_range=(low, high), out_range=(0, 1)
+    )
 
 
 def save_multispectral_images(
@@ -1375,37 +1438,6 @@ def save_single_jpg(
     )
 
 
-def save_sar_jpg(tif, filepath):
-    """
-    Saves a SAR (Synthetic Aperture Radar) image from a GeoTIFF file as a JPEG file.
-    This function reads a SAR image from the specified GeoTIFF file, rescales its intensity values
-    to the range [0, 1] using a predefined input range of [-45, 5], converts the rescaled image to
-    an 8-bit unsigned integer format, and saves it as a JPEG file.
-    Args:
-        tif (str): The file path to the input GeoTIFF file containing the SAR image.
-        filepath (str): The file path where the output JPEG image will be saved.
-    Returns:
-        None
-    Notes:
-        - The input intensity range [-45, 5] is based on the original CoastSeg article.
-        - The output JPEG image is saved with maximum quality (quality=100).
-    """
-    data_S1 = gdal.Open(tif)
-    bands_sar = [
-        data_S1.GetRasterBand(k + 1).ReadAsArray() for k in range(data_S1.RasterCount)
-    ]
-    im_S1 = bands_sar[0]
-
-    # Rescale intensities to the [0, 1] range. Use the range -45 to 5 for the input image based on original coastseg artic
-    im_S1_rescaled = exposure.rescale_intensity(
-        im_S1, in_range=(-45, 5), out_range=(0, 1)
-    )
-    # Convert the rescaled image to uint8, so we can save it as a jpg
-    im_S1_uint8 = img_as_ubyte(im_S1_rescaled)
-
-    imageio.imwrite(filepath, im_S1_uint8, quality=100)
-
-
 def save_jpg(metadata, settings, **kwargs):
     """
     Saves a .jpg image for all the images contained in metadata.
@@ -1455,20 +1487,26 @@ def save_jpg(metadata, settings, **kwargs):
         print("%s: %d images" % (satname, len(filenames)))
         # loop through images
         for i in range(len(filenames)):
-            # S1 has a different format than the other images
-            if satname == "S1":
-                # Save SAR image as jpg
-                tif = filenames[i]
-                date_S1 = tif.split("_")[0]
-                polar = tif.split("_")[-1].split(".")[0]
-                sar_jpg_path = os.path.join(
-                    filepath_jpg, date_S1 + "_" + polar + "_" + satname + ".jpg"
-                )
-                save_sar_jpg(filenames[i], sar_jpg_path)
-                continue
             print("\r%d%%" % int((i + 1) / len(filenames) * 100), end="")
             # image filename
             fn = SDS_tools.get_filenames(filenames[i], filepath, satname)
+            # SAR has no cloud mask and no pansharpening, so it takes the simpler
+            # preprocess_image path instead of preprocess_single
+            if satname == "S1":
+                im_ms, georef, cloud_mask, im_nodata = preprocess_image(
+                    fn, satname, settings, collection
+                )
+                plt.ioff()  # turning interactive plotting off
+                create_jpg(
+                    im_ms,
+                    cloud_mask,
+                    filenames[i][:19],
+                    satname,
+                    filepath_jpg,
+                    im_nodata=im_nodata,
+                    **kwargs,
+                )
+                continue
             # read and preprocess image
             apply_cloud_mask = settings.get("apply_cloud_mask", True)
             try:
@@ -1568,10 +1606,11 @@ def get_reference_sl(metadata, settings):
     # if it exist, load it and return it
     if filename in os.listdir(filepath):
         print("Reference shoreline already exists and was loaded")
-        with open(
-            os.path.join(filepath, sitename + "_reference_shoreline.pkl"), "rb"
-        ) as f:
-            refsl = pickle.load(f)
+        # load_pickle() rather than pickle.load(): reference shorelines saved by a
+        # NumPy 2 environment name numpy._core, which NumPy 1.x cannot import.
+        refsl = SDS_tools.load_pickle(
+            os.path.join(filepath, sitename + "_reference_shoreline.pkl")
+        )
         return refsl
     # otherwise get the user to manually digitise a shoreline on
     # S2, L8, L9 or L5 images (no L7 because of scan line error)

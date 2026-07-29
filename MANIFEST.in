@@ -1,37 +1,20 @@
 include MANIFEST.in
-include LICENSE
+include LICENSE.md
 include pyproject.toml
-include *.md
+# README.md is required: pyproject.toml sets readme = "README.md".
+include README.md
 
-# Include src directories in package
+# pyproject.toml's [tool.pixi.workspace.conda-pypi-map] points at this file by relative path,
+# so an sdist without it fails `pixi install`.
+include conda-pypi-map.json
+
 graft src
 
+# The SAR .onnx model is downloaded on demand (SDS_sar_model), never shipped
+recursive-exclude src *.onnx
 
-# Remove the pycache directory and any pycache files
-prune src/coastseg/__pycache__
+# graft src would otherwise sweep in compiled files
 recursive-exclude * *.py[co]
 
-# don't include the tests, docs, scripts or paper
+# setuptools adds tests/ to the sdist by default -- load-bearing, verified
 prune tests
-prune docs
-prune scripts
-prune paper
-
-
-exclude .gitignore
-exclude .gitattributes
-prune .git
-prune .github
-exclude .editorconfig
-exclude .pre-commit-config.yaml
-exclude .flake8
-exclude .pylintrc
-exclude tox.ini
-
-prune build
-prune dist
-
-exclude *.log
-prune __pycache__
-
-

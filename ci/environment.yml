@@ -1,0 +1,49 @@
+# Conda spec for the GitHub Actions test matrix (.github/workflows/tests.yml).
+#
+# This mirrors [tool.pixi.dependencies] in pyproject.toml with exactly ONE deliberate
+# difference: there is no `python` entry. Pixi pins python to a specific version so it 
+# cannot be used to test all python versions
+name: coastsat-ci
+channels:
+  - conda-forge
+dependencies:
+  #The interpreter is injected by the workflow. Do not add `python` here.
+  - pip
+
+  - astropy
+  - "earthengine-api>=0.1.304"
+  # The reason this file exists at all. GDAL publishes no wheels on PyPI, and
+  # SDS_tools.py, SDS_preprocess.py and gdal_merge.py all do from osgeo import gdal at module scope
+  - gdal
+  - geopandas
+  - google-auth
+  - imageio
+  - importlib_resources
+  # SDS_shoreline loads the .pkl classifiers with joblib.load; it only reaches the
+  # environment today as a scikit-learn transitive dep, so declare it directly.
+  - joblib
+  # The conda-forge `matplotlib` metapackage is matplotlib-base plus a GUI toolkit (it pulls
+  # pyqt). Nothing under test touches a canvas -- MPLBACKEND=Agg is set at the job level --
+  # so swapping this to `matplotlib-base` and dropping `pyqt` below is the lever to reach for
+  # if a leg fails to solve. Kept as the metapackage so CI installs what pixi installs.
+  - matplotlib
+  # numpy 2 on purpose. Pickles written under numpy 2 reference `numpy._core`, which numpy
+  # 1.x cannot import at all
+  - "numpy>=2"
+  # Pin the CPU build 
+  - "onnxruntime=*=*cpu*"
+  - pandas
+  - pillow
+  - pooch
+  - "pyqt=5.15.*"
+  - pytz
+  - requests
+  - "scikit-image>=0.25"
+  - scikit-learn
+  - scipy
+  - shapely
+  - tqdm
+
+  # Test tooling
+  - "pytest>=8"
+  - "pytest-cov>=5"

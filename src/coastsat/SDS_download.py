@@ -18,16 +18,13 @@ from typing import Any, Dict, List, Tuple, Union, Optional
 import zipfile
 import functools
 
-
 # Third-party imports
 import ee
 import google.auth
-import imageio
 import matplotlib.pyplot as plt
 import numpy as np
 import pytz
 import requests
-from skimage import exposure, img_as_ubyte
 from tqdm.auto import tqdm
 
 # raise an error in case gdal is missing
@@ -44,6 +41,10 @@ from coastsat import SDS_preprocess, SDS_tools
 
 np.seterr(all="ignore")  # raise/ignore divisions by 0 and nans
 gdal.PushErrorHandler("CPLQuietErrorHandler")
+
+# Sentinel-1 acquisition modes and orbit directions accepted in sentinel_1_properties.
+VALID_S1_INSTRUMENT_MODES = ("IW", "EW", "SM", "WV")
+VALID_S1_ORBIT_PASSES = ("ASCENDING", "DESCENDING")
 
 
 def get_skip_cache_path(inputs: dict) -> str:
@@ -417,7 +418,7 @@ def get_file_name(
 
 
 def write_metadata_file(
-    filepath: str, filename_txt: str, polar: str, metadata: dict
+    filepath: str, filename_txt: str, metadata: dict, polar: str = None
 ) -> None:
     """
     Writes metadata to a text file.
@@ -425,10 +426,13 @@ def write_metadata_file(
     Args:
         filepath (str): Path to save the metadata file.
         filename_txt (str): Base name of the file.
-        polar (str): Polarization.
         metadata (dict): Metadata dictionary.
+        polar (str, optional): legacy per-polarization suffix. Leave unset so the
+            file is named like the optical ones ('{date}_{sat}_{site}.txt'); a
+            Sentinel-1 scene gets one metadata file covering all its polarizations.
     """
-    with open(os.path.join(filepath, f"{filename_txt}_{polar}.txt"), "w") as f:
+    name = f"{filename_txt}_{polar}.txt" if polar else f"{filename_txt}.txt"
+    with open(os.path.join(filepath, name), "w") as f:
         for key, value in metadata.items():
             f.write(f"{key}\t{value}\n")
 
@@ -634,7 +638,7 @@ def retry(func):
                 return func(*args, **kwargs)
             except Exception as e:
                 print(
-                    f"Attempt {attempt+1}/{max_attempts} failed with error: {type(e).__name__}"
+                    f"Attempt {attempt + 1}/{max_attempts} failed with error: {type(e).__name__}"
                 )
                 if logger:
                     logger.warning(
@@ -642,7 +646,7 @@ def retry(func):
                     )
                 if attempt == max_attempts - 1:
                     print(
-                        f"Max retries {attempt+1}/{max_attempts}  exceeded for {func.__name__} due to {type(e).__name__}"
+                        f"Max retries {attempt + 1}/{max_attempts}  exceeded for {func.__name__} due to {type(e).__name__}"
                     )
                     raise
 
@@ -781,13 +785,76 @@ def split_date_range(start_date, end_date, num_splits):
     return split_ranges
 
 
-def create_polarization_filter(polarizations):
+DEFAULT_SENTINEL_1_PROPERTIES = {
+    "transmitterReceiverPolarisation": list(SDS_tools.DEFAULT_SAR_POLARIZATIONS),
+    "instrumentMode": "IW",
+}
+
+
+def get_sentinel1_polarizations(inputs, default_properties=None, logger=None) -> list:
+    """
+    Returns the Sentinel-1 polarizations to download, in canonical order.
+
+    Defaults to SDS_tools.DEFAULT_SAR_POLARIZATIONS (VV and VH), which is what the
+    [VV, VH, VV-VH] composite needs. The requested list is normalised to
+    SDS_tools.SAR_POLARIZATIONS order so the folder layout and the channel order of
+    im_ms never depend on the order the user happened to list them in.
+
+    Args:
+        inputs (dict): may contain 'sentinel_1_properties'
+        default_properties (dict, optional): defaults to DEFAULT_SENTINEL_1_PROPERTIES
+        logger (optional): used to warn when no properties were provided
+
+    Returns:
+        list of str: polarizations in SAR_POLARIZATIONS order, e.g. ['VV', 'VH']
+
+    Raises:
+        ValueError: if the list is empty or contains an unknown polarization
+    """
+    defaults = default_properties or DEFAULT_SENTINEL_1_PROPERTIES
+    user_properties = inputs.get("sentinel_1_properties") or {}
+    if not user_properties and logger is not None:
+        logger.warning(
+            "No user-defined Sentinel-1 properties provided. Using default values."
+        )
+    # user values override defaults key by key
+    merged_properties = {**defaults, **user_properties}
+
+    polarizations = merged_properties.get(
+        "transmitterReceiverPolarisation", SDS_tools.DEFAULT_SAR_POLARIZATIONS
+    )
+    if isinstance(polarizations, str):
+        polarizations = [polarizations]
+    requested = {
+        str(polar).strip().upper() for polar in polarizations if str(polar).strip()
+    }
+    if not requested:
+        raise ValueError(
+            "sentinel_1_properties['transmitterReceiverPolarisation'] must list "
+            "at least one polarization."
+        )
+
+    invalid_pols = sorted(requested - set(SDS_tools.SAR_POLARIZATIONS))
+    if invalid_pols:
+        raise ValueError(
+            f"Invalid polarizations: {invalid_pols}. "
+            f"Valid options are: {list(SDS_tools.SAR_POLARIZATIONS)}"
+        )
+
+    return [polar for polar in SDS_tools.SAR_POLARIZATIONS if polar in requested]
+
+
+def create_polarization_filter(polarizations, mode: str = "and"):
     """
     Creates an Earth Engine filter for the specified polarizations.
 
     Args:
         polarizations: str or list of str
             Single polarization (e.g., 'VV') or list of polarizations (e.g., ['VV', 'VH'])
+        mode: str
+            'and' (default) keeps only scenes carrying EVERY requested polarization,
+            which is what downloading a matched set of polarizations requires.
+            'or' keeps scenes carrying any of them.
 
     Returns:
         ee.Filter: Combined filter for the specified polarizations
@@ -795,14 +862,17 @@ def create_polarization_filter(polarizations):
     # Convert single polarization to list if needed
     if isinstance(polarizations, str):
         polarizations = [polarizations]
+    polarizations = list(polarizations)
+    if not polarizations:
+        raise ValueError("At least one polarization must be requested.")
 
-    # Validate polarizations
-    valid_pols = {"VV", "VH", "HH", "HV"}
-    invalid_pols = set(polarizations) - valid_pols
+    # Validate polarizations (kept a list so the message is deterministically ordered)
+    valid_pols = SDS_tools.SAR_POLARIZATIONS
+    invalid_pols = [p for p in polarizations if p not in valid_pols]
     if invalid_pols:
         raise ValueError(
             f"Invalid polarizations: {invalid_pols}. "
-            f"Valid options are: {valid_pols}"
+            f"Valid options are: {list(valid_pols)}"
         )
 
     # Create individual filters
@@ -810,9 +880,61 @@ def create_polarization_filter(polarizations):
         ee.Filter.listContains("transmitterReceiverPolarisation", p)
         for p in polarizations
     ]
+    if len(polar_filters) == 1:
+        return polar_filters[0]
 
-    # Combine filters with OR logic
-    return ee.Filter.Or(*polar_filters)
+    mode = str(mode).lower()
+    if mode == "and":
+        return ee.Filter.And(*polar_filters)
+    if mode == "or":
+        return ee.Filter.Or(*polar_filters)
+    raise ValueError(
+        f"Unknown polarization filter mode: {mode!r} (expected 'and' or 'or')."
+    )
+
+
+def create_sentinel1_metadata_filters(properties):
+    """
+    Builds the ee.Filters for the Sentinel-1 scene metadata in sentinel_1_properties.
+
+    Covers the two properties other than the polarizations (which have their own
+    filter, see create_polarization_filter): 'instrumentMode' and
+    'orbitProperties_pass'. A property that is absent or empty contributes no filter,
+    so orbit direction stays unrestricted unless the user asks for one.
+
+    Args:
+        properties (dict): merged sentinel_1_properties, e.g.
+            {"instrumentMode": "IW", "orbitProperties_pass": "DESCENDING"}
+
+    Returns:
+        list of ee.Filter: the filters to apply to the S1 collection
+
+    Raises:
+        ValueError: if a value is not a valid mode or orbit direction
+    """
+    filters = []
+
+    instrument_mode = properties.get("instrumentMode")
+    if instrument_mode:
+        instrument_mode = str(instrument_mode).strip().upper()
+        if instrument_mode not in VALID_S1_INSTRUMENT_MODES:
+            raise ValueError(
+                f"Invalid Sentinel-1 instrumentMode: {instrument_mode!r}. "
+                f"Valid options are: {list(VALID_S1_INSTRUMENT_MODES)}"
+            )
+        filters.append(ee.Filter.eq("instrumentMode", instrument_mode))
+
+    orbit_pass = properties.get("orbitProperties_pass")
+    if orbit_pass:
+        orbit_pass = str(orbit_pass).strip().upper()
+        if orbit_pass not in VALID_S1_ORBIT_PASSES:
+            raise ValueError(
+                f"Invalid Sentinel-1 orbitProperties_pass: {orbit_pass!r}. "
+                f"Valid options are: {list(VALID_S1_ORBIT_PASSES)}"
+            )
+        filters.append(ee.Filter.eq("orbitProperties_pass", orbit_pass))
+
+    return filters
 
 
 def get_tier1_images(inputs, polygon, dates, scene_cloud_cover, months_list):
@@ -841,11 +963,8 @@ def get_tier1_images(inputs, polygon, dates, scene_cloud_cover, months_list):
                 'L8': [image1, image2, ...],
                 'L9': [image1, image2, ...],
                 'S2': [image1, image2, ...],
-                'S1': {
-                    'VH': [image1, image2, ...],
-                    'HH': [image1, image2, ...]
-
-                }
+                'S1': [image1, image2, ...],
+            }
 
     """
     print("- In Landsat Tier 1 & Sentinel-2 Level-1C:")
@@ -858,37 +977,34 @@ def get_tier1_images(inputs, polygon, dates, scene_cloud_cover, months_list):
         "S1": "COPERNICUS/S1_GRD",
     }
 
-    default_sentinel_1_properties = {
-        "transmitterReceiverPolarisation": ["VH"],
-        "instrumentMode": "IW",
-    }
-
     im_dict_T1 = dict([])
     for satname in inputs["sat_list"]:
         im_dict_T1[satname] = []
         if satname == "S1":
-            # If the satellite is Sentinel-1, and no polarization is specified, use the default properties
-            sentinel_1_properties = inputs.get(
-                "sentinel_1_properties", default_sentinel_1_properties
+            # One query for all the requested polarizations, AND-filtered so that every
+            # scene returned carries all of them. Querying once per polarization would
+            # return each dual-pol scene several times over.
+            polarizations = get_sentinel1_polarizations(inputs)
+            # user values override the defaults key by key; instrumentMode and
+            # orbitProperties_pass become metadata filters on the collection
+            s1_properties = {
+                **DEFAULT_SENTINEL_1_PROPERTIES,
+                **(inputs.get("sentinel_1_properties") or {}),
+            }
+            im_list = get_image_info(
+                col_names_T1[satname],
+                satname,
+                polygon,
+                dates,
+                S2tile=inputs.get("S2tile", ""),
+                scene_cloud_cover=scene_cloud_cover,
+                months_list=months_list,
+                polar=polarizations,
+                sentinel_1_properties=s1_properties,
+                min_roi_coverage=inputs.get("min_roi_coverage", 0.30),
             )
-            polarizations = sentinel_1_properties.get(
-                "transmitterReceiverPolarisation", ["VH"]
-            )
-            # for each transmitter get the images
-            for polar in polarizations:
-                im_list = get_image_info(
-                    col_names_T1[satname],
-                    satname,
-                    polygon,
-                    dates,
-                    S2tile=inputs.get("S2tile", ""),
-                    scene_cloud_cover=scene_cloud_cover,
-                    months_list=months_list,
-                    polar=polar,
-                    min_roi_coverage=inputs.get("min_roi_coverage", 0.30),
-                )
-                im_dict_T1[satname].extend(im_list)
-                print(f"     {satname} {polar}: {len(im_list)} images")
+            im_dict_T1[satname] = im_list
+            print(f"     {satname} {'+'.join(polarizations)}: {len(im_list)} images")
         else:
             # get the list of images available for the particular satellite at the location given by the polygon and the dates
             im_list = get_image_info(
@@ -925,7 +1041,7 @@ def remove_existing_images_if_needed(inputs, im_dict_T1):
     if os.path.exists(filepath):
         sat_list = inputs["sat_list"]
         metadata = get_metadata(inputs)
-        im_dict_T1 = remove_existing_imagery(im_dict_T1, metadata, sat_list)
+        im_dict_T1 = remove_existing_imagery(im_dict_T1, metadata, sat_list, inputs)
     return im_dict_T1
 
 
@@ -954,11 +1070,8 @@ def get_tier2_images(inputs, polygon, dates_str, scene_cloud_cover, months_list)
                 'L8': [image1, image2, ...],
                 'L9': [image1, image2, ...],
                 'S2': [image1, image2, ...],
-                'S1': {
-                    'VH': [image1, image2, ...],
-                    'HH': [image1, image2, ...]
-
-                }
+                'S1': [image1, image2, ...],
+            }
 
 
     """
@@ -970,8 +1083,8 @@ def get_tier2_images(inputs, polygon, dates_str, scene_cloud_cover, months_list)
     }
     im_dict_T2 = dict([])
     for satname in inputs["sat_list"]:
-        if satname in ["L9", "S2"]:
-            continue  # no Tier 2 for Sentinel-2 and Landsat 9
+        if satname not in col_names_T2:
+            continue  # only L5/L7/L8 have a Tier 2 collection (not L9, S2 or S1)
         im_list = get_image_info(
             col_names_T2[satname],
             satname,
@@ -1188,6 +1301,8 @@ def get_image_info(
         additional arguments to pass to the function (e.g. S2tile, polar)
         polar: list of polarizations to filter by (e.g. ['HH', 'VH'])
         S2tile: Sentinel-2 tile name to filter the images (e.g. '58GGP')
+        sentinel_1_properties: dict of S1 metadata to filter by, see
+            create_sentinel1_metadata_filters (instrumentMode, orbitProperties_pass)
 
     Returns:
     -----------
@@ -1203,10 +1318,17 @@ def get_image_info(
         start_date, end_date
     )
 
-    # If "polar" is included it contains a list of polarizations to filter by. Example: ['HH', 'VH']
+    # If "polar" is included it contains a list of polarizations to filter by. Example: ['VV', 'VH']
+    # Only scenes carrying ALL of them are kept, so every image can supply the full set.
     if kwargs.get("polar"):
-        polar_filter = create_polarization_filter(kwargs["polar"])
+        polar_filter = create_polarization_filter(kwargs["polar"], mode="and")
         ee_col = ee_col.filter(polar_filter)
+
+    # Sentinel-1 scene metadata filters: instrumentMode and orbitProperties_pass
+    for metadata_filter in create_sentinel1_metadata_filters(
+        kwargs.get("sentinel_1_properties") or {}
+    ):
+        ee_col = ee_col.filter(metadata_filter)
 
     # If "S2tile" key is in kwargs and its associated value is truthy (not an empty string, None, etc.),
     # then apply an additional filter to the collection.
@@ -1245,18 +1367,6 @@ def get_image_info(
         ),
     )
     return im_list
-
-
-def _filter_by_polarization(
-    collection: ee.ImageCollection, polarizations: list
-) -> ee.ImageCollection:
-    """Filters a collection by SAR polarizations."""
-    filters = [
-        ee.Filter.listContains("transmitterReceiverPolarisation", p)
-        for p in polarizations
-    ]
-    combined_filter = ee.Filter.Or(*filters)
-    return collection.filter(combined_filter)
 
 
 @retry
@@ -1390,8 +1500,7 @@ def handle_duplicate_image_names(
         duplicate_counter += 1
         for key in bands.keys():
             im_fn[key] = (
-                f"{im_date}_{satname}_{sitename}"
-                f"_{key}_dup{duplicate_counter}{suffix}"
+                f"{im_date}_{satname}_{sitename}_{key}_dup{duplicate_counter}{suffix}"
             )
     return im_fn
 
@@ -1447,9 +1556,8 @@ def count_total_images(image_dict, tier=1):
 
     Example:
         im_dict_T1 = {
-            'S1': {'VH': [1, 2, 3, 4], 'VV': [5, 6, 7, 8]},
+            'S1': [1, 2, 3, 4],
             'S2': [9, 10, 11],
-            'Landsat': {'B1': [12, 13], 'B2': [14]}
         }
 
         count_total_images(im_dict_T1)
@@ -1582,58 +1690,25 @@ def check_images_available(
     return im_dict_T1, im_dict_T2
 
 
-def save_sar_jpg(tif, filepath):
+def download_S1_image(image_ee, polygon, polarization, save_path, **kwargs):
     """
-    Saves a SAR (Synthetic Aperture Radar) image from a GeoTIFF file as a JPEG file.
-    This function reads a GeoTIFF file, rescales the intensity values of the first band
-    to the range [0, 1] using a predefined input range of [-45, 5], converts the rescaled
-    image to an 8-bit unsigned integer format, and saves it as a JPEG file.
-    Parameters:
-        tif (str): The file path to the input GeoTIFF file.
-        filepath (str): The file path where the output JPEG file will be saved.
+    Downloads a single polarization of a Sentinel-1 scene as a single-band .tif.
+
+    Args:
+        image_ee (ee.Image): the Sentinel-1 image.
+        polygon (list): the ROI to crop to.
+        polarization (str): the polarization band to download, e.g. 'VH'.
+        save_path (str): folder to download into.
+        **kwargs: forwarded to download_tif (image_id and logger, used by @retry).
+
     Returns:
-        None
+        str: path to the downloaded .tif.
     """
-    # data_S1 = gdal.Open(tif)
-    # bands_sar = [
-    #     data_S1.GetRasterBand(k + 1).ReadAsArray() for k in range(data_S1.RasterCount)
-    # ]
-    bands_sar = SDS_preprocess.read_bands(tif, "S1")
-    im_S1 = bands_sar[0]
-    # Rescale intensities to the [0, 1] range. Use the range -45 to 5 for the input image based on original coastseg artic
-    im_S1_rescaled = exposure.rescale_intensity(
-        im_S1, in_range=(-45, 5), out_range=(0, 1)
-    )
-    # Convert the rescaled image to uint8, so we can save it as a jpg
-    im_S1_uint8 = img_as_ubyte(im_S1_rescaled)
-    # get the name of the directory where the image is saved
-    im_dir = os.path.dirname(filepath)
-    # create the directory if it does not exist
-    os.makedirs(im_dir, exist_ok=True)
-    # Save the image as a JPEG file with 100% quality
-    imageio.imwrite(filepath, im_S1_uint8, quality=100)
-
-
-def download_S1_image(image_ee, polygon, polarization, save_path):
-    # Get region and download
+    # Get region and download. The ROI is snapped to this band's native pixel grid so
+    # no resampling happens; all polarizations of a GRD scene share that grid.
     proj = image_ee.select(polarization).projection()
-    region = adjust_polygon(polygon, proj)
-    return download_tif(image_ee, region, polarization, save_path, "S1")
-
-
-def rename_image_file(
-    default_path, im_date, sitename, polar, suffix, save_dir, all_names
-):
-    filename = get_file_name(im_date, "S1", sitename, polar, suffix, all_names)
-    new_filepath = os.path.join(save_dir, filename)
-
-    if os.path.exists(new_filepath):
-        os.remove(new_filepath)
-
-    os.rename(default_path, new_filepath)
-    all_names.append(filename)
-
-    return filename, new_filepath
+    region = adjust_polygon(polygon, proj, **kwargs)
+    return download_tif(image_ee, region, polarization, save_path, "S1", **kwargs)
 
 
 def process_sentinel1_image(
@@ -1648,84 +1723,118 @@ def process_sentinel1_image(
     default_sentinel_1_properties=None,
 ):
     """
-    Processes a single Sentinel-1 image: downloads, renames, and saves metadata.
+    Processes a single Sentinel-1 image: downloads every requested polarization,
+    renames them, and saves one metadata file for the scene.
+
+    Each polarization is saved as its own single-band .tif in its own folder
+    (S1/VV/, S1/VH/, ...). The files of a scene share a name apart from the
+    polarization token, which is how the read path pairs them back up.
 
     Returns:
-        dict: Contains 'skip_image' (always False here), 'filename_ms', 'im_fn'
+        dict: Contains 'skip_image', and on success 'filename_ms', 'im_fn' and
+        'band_order' (the polarizations downloaded, in canonical order).
     """
     try:
-        if not default_sentinel_1_properties:
-            default_sentinel_1_properties = {
-                "transmitterReceiverPolarisation": ["VH"],
-                "instrumentMode": "IW",
-            }
+        polarizations = get_sentinel1_polarizations(
+            inputs, default_sentinel_1_properties, logger=logger
+        )
 
-        # Get the user-provided properties if they exist, otherwise an empty dict
-        user_properties = inputs.get("sentinel_1_properties", {})
-        if not user_properties:
+        # Require every requested polarization: a scene missing one is skipped entirely
+        # rather than downloaded as a partial set.
+        bands_by_id = {band.get("id"): band for band in im_meta.get("bands", [])}
+        missing = [polar for polar in polarizations if polar not in bands_by_id]
+        if missing:
             logger.warning(
-                "No user-defined Sentinel-1 properties provided. Using default values."
+                f"Skipping Sentinel-1 image {im_meta.get('id', 'unknown')}: missing "
+                f"polarization(s) {missing}; scene carries {sorted(bands_by_id)}"
+            )
+            return {"skip_image": True}
+
+        # the polarizations of a scene must share a pixel grid or the stack would be
+        # misaligned when they are read back together
+        grids = {
+            (
+                bands_by_id[polar].get("crs"),
+                tuple(bands_by_id[polar].get("crs_transform", ())),
+            )
+            for polar in polarizations
+        }
+        if len(grids) > 1:
+            logger.warning(
+                f"Sentinel-1 image {im_meta.get('id', 'unknown')}: polarizations "
+                f"{polarizations} are not on the same pixel grid, the stacked bands "
+                "may be misaligned."
             )
 
-        # Merge with defaults — user values override defaults if present
-        merged_properties = {**default_sentinel_1_properties, **user_properties}
+        im_epsg = int(bands_by_id[polarizations[0]]["crs"][5:])
+        # map polarization -> its folder; filepaths is [meta, <polar1>, <polar2>, ...]
+        fp_by_polar = {os.path.basename(fp): fp for fp in filepaths[1:]}
 
-        # Now you can safely access the values
-        polarizations = merged_properties["transmitterReceiverPolarisation"]
-        polar = polarizations[0]  # Use the first polarization for now
+        downloaded = []  # (polar, filename, path) for each polarization written
+        try:
+            for polar in polarizations:
+                fp = fp_by_polar[polar]
+                default_tif_path = download_S1_image(
+                    image_ee,
+                    inputs["polygon"],
+                    polar,
+                    fp,
+                    image_id=im_meta.get("id"),
+                    logger=logger,
+                )
 
-        # for each polarization in the list of polarizations load the band
-        def get_band_for_polarization(polarization, image_metadata):
-            matching_bands = [
-                band for band in image_metadata["bands"] if polarization in band["id"]
-            ]
-            return matching_bands[0] if matching_bands else None
+                # Create safe filename (get_file_name adds it to all_names itself)
+                filename = get_file_name(
+                    im_date, "S1", inputs["sitename"], polar, suffix, all_names
+                )
+                new_filepath = os.path.join(fp, filename)
+                if os.path.exists(new_filepath):
+                    os.remove(new_filepath)  # Remove the existing file before renaming
+                os.rename(default_tif_path, new_filepath)
+                downloaded.append((polar, filename, new_filepath))
+        except Exception:
+            # never leave a scene with only some of its polarizations on disk
+            for _, _, path in downloaded:
+                for stale in (path, path + ".aux.xml"):
+                    if os.path.exists(stale):
+                        os.remove(stale)
+            raise
 
-        band = get_band_for_polarization(polar, im_meta)
-        if not band:
-            return {"skip_image": True}  # No usable band
+        # One metadata file per scene, named like the optical ones. Writing one per
+        # polarization would make get_metadata() list every scene more than once.
+        primary_polar, primary_filename, primary_path = downloaded[0]
+        width, height = SDS_tools.get_image_dimensions(primary_path)
 
-        im_epsg = int(band["crs"][5:])
-        fp = filepaths[1]  # Where to save the .tif
-
-        default_tif_path = download_S1_image(image_ee, inputs["polygon"], polar, fp)
-
-        # Create safe filename
-        filename = get_file_name(
-            im_date, "S1", inputs["sitename"], polar, suffix, all_names
+        filename_txt = primary_filename.replace(f"_{primary_polar}", "").replace(
+            ".tif", ""
         )
-        new_filepath = os.path.join(fp, filename)
-        if os.path.exists(new_filepath):
-            os.remove(new_filepath)  # Remove the existing file before renaming
-        os.rename(default_tif_path, new_filepath)
-
-        all_names.append(filename)
-
-        # Get dimensions
-        width, height = SDS_tools.get_image_dimensions(new_filepath)
-
-        # Metadata
-        filename_txt = filename.replace(f"_{polar}", "").replace(".tif", "")
         metadict = {
-            "filename": filename,
+            "filename": primary_filename,
             "epsg": im_epsg,
             "im_width": width,
             "im_height": height,
+            # polarizations downloaded for this scene, in the order they are stacked
+            "band_order": polarizations,
             "orbitProperties_pass": im_meta["properties"]["orbitProperties_pass"],
             "transmitterReceiverPolarisation": im_meta["properties"][
                 "transmitterReceiverPolarisation"
             ],
-            "saved_polarization": polar,
             "resolution": im_meta["properties"]["resolution"],
             "resolution_meters": im_meta["properties"]["resolution_meters"],
             "instrumentMode": im_meta["properties"]["instrumentMode"],
         }
-        write_metadata_file(filepaths[0], filename_txt, polar, metadict)
+        write_metadata_file(filepaths[0], filename_txt, metadict)
+
+        logger.info(
+            f"Downloaded Sentinel-1 image {im_meta.get('id', 'unknown')} as "
+            f"{filename_txt} with polarizations {polarizations}"
+        )
 
         return {
             "skip_image": False,
-            "filename_ms": filename,
-            "im_fn": {"ms": filename},  # Maintain consistency
+            "filename_ms": primary_filename,
+            "im_fn": {"ms": primary_filename},  # Maintain consistency
+            "band_order": polarizations,
         }
     except Exception as e:
         logger.error(
@@ -1858,8 +1967,9 @@ def retrieve_images(
         "L8": ["B2", "B3", "B4", "B5", "B6", qa_band_Landsat],
         "L9": ["B2", "B3", "B4", "B5", "B6", qa_band_Landsat],
         "S2": ["B2", "B3", "B4", "B8", "s2cloudless", "B11", qa_band_S2],
-        "S1": ["VH"],
-    }  # S1 is just a dummy entry that is not used
+        # S1 bands come from inputs['sentinel_1_properties'], not from this table
+        "S1": [],
+    }
 
     sat_list = inputs["sat_list"]
     dates = inputs["dates"]
@@ -1882,7 +1992,7 @@ def retrieve_images(
     # create/update cache file before downloads start so progress survives interruptions
     save_skip_cache(inputs, skip_cache)
     skip_cache_dirty = False  # flag to track if cache has pending changes that need to be flushed to disk
-    processed_images_since_flush = 0 # counter to track how many images have been processed since the last cache flush
+    processed_images_since_flush = 0  # counter to track how many images have been processed since the last cache flush
 
     def flush_skip_cache_if_needed(force: bool = False):
         nonlocal skip_cache_dirty, processed_images_since_flush
@@ -1893,8 +2003,8 @@ def retrieve_images(
 
         if skip_cache_dirty and (force or interval_reached):
             save_skip_cache(inputs, skip_cache)
-            skip_cache_dirty = False # reset dirty flag after flush
-            processed_images_since_flush = 0 # reset counter after flush
+            skip_cache_dirty = False  # reset dirty flag after flush
+            processed_images_since_flush = 0  # reset counter after flush
 
     if removed_cache_entries > 0:
         print(
@@ -1917,7 +2027,9 @@ def retrieve_images(
         ):
             count += 1
             # create subfolder structure to store the different bands
-            filepaths = SDS_tools.create_folder_structure(im_folder, satname)
+            # (for S1 that is one folder per requested polarization)
+            polars = get_sentinel1_polarizations(inputs) if satname == "S1" else None
+            filepaths = SDS_tools.create_folder_structure(im_folder, satname, polars)
             # initialise variables and loop through images
 
             bands_id = bands_dict[satname]
@@ -2012,7 +2124,6 @@ def retrieve_images(
                     # Sentinel-1 download
                     # =============================================================================================#
                     if satname == "S1":
-
                         result = process_sentinel1_image(
                             image_ee,
                             im_meta,
@@ -2516,11 +2627,11 @@ def retrieve_images(
                         )
                 except Exception as error:
                     print(
-                        f"\nThe download for satellite {satname} image '{im_meta.get('id','unknown')}' failed due to {type(error).__name__ }"
+                        f"\nThe download for satellite {satname} image '{im_meta.get('id', 'unknown')}' failed due to {type(error).__name__}"
                     )
                     print(error)
                     logger.error(
-                        f"The download for satellite {satname} {im_meta.get('id','unknown')} failed due to \n {error} \n Traceback {traceback.format_exc()}"
+                        f"The download for satellite {satname} {im_meta.get('id', 'unknown')} failed due to \n {error} \n Traceback {traceback.format_exc()}"
                     )
                     continue
                 finally:
@@ -2542,10 +2653,12 @@ def retrieve_images(
                             )
                     except Exception as e:
                         logger.error(
-                            f"Could not save metadata for {im_meta.get('id','unknown')} that failed.\n{e}"
+                            f"Could not save metadata for {im_meta.get('id', 'unknown')} that failed.\n{e}"
                         )
                     finally:
-                        processed_images_since_flush += 1 # increment the counter for processed images
+                        processed_images_since_flush += (
+                            1  # increment the counter for processed images
+                        )
                         flush_skip_cache_if_needed()
 
     flush_skip_cache_if_needed(force=True)
@@ -2623,6 +2736,30 @@ def read_metadata_file(filepath: str) -> Dict[str, Union[str, int, float]]:
     return metadata
 
 
+def get_band_order_from_meta(meta_info: dict) -> list:
+    """
+    Returns the polarization order recorded in a Sentinel-1 metadata file.
+
+    New metadata files carry 'band_order'. Files written before multi-polarization
+    support only carry 'saved_polarization'; older ones carry neither.
+
+    Args:
+        meta_info (dict): parsed contents of a metadata .txt file.
+
+    Returns:
+        list of str: the polarizations of the scene, or [] if it recorded none.
+    """
+    band_order = meta_info.get("band_order")
+    if isinstance(band_order, str):
+        band_order = [polar.strip() for polar in band_order.split(",") if polar.strip()]
+    if band_order:
+        return list(band_order)
+    saved_polarization = meta_info.get("saved_polarization")
+    if saved_polarization:
+        return [str(saved_polarization)]
+    return []
+
+
 def format_date(date_str: str) -> datetime:
     """
     Converts a date string to a datetime object in UTC timezone.
@@ -2658,7 +2795,7 @@ def format_date(date_str: str) -> datetime:
 
 
 def get_metadata(inputs: dict) -> dict:
-    """
+    r"""
     Gets the metadata from the downloaded images by parsing .txt files located
     in the \meta subfolder.
 
@@ -2702,6 +2839,9 @@ def get_metadata(inputs: dict) -> dict:
                 "im_quality": [],
                 "im_dimensions": [],
             }
+            if satname == "S1":
+                # polarizations held by each scene, index-aligned with 'filenames'
+                metadata[satname]["band_order"] = []
             # directory where the metadata .txt files are stored
             filepath_meta = os.path.join(sat_path, "meta")
             # get the list of filenames and sort it chronologically
@@ -2731,6 +2871,11 @@ def get_metadata(inputs: dict) -> dict:
                     parse_date_from_filename(meta_info["filename"])
                 )
                 metadata[satname]["im_quality"].append(meta_info["im_quality"])
+                if satname == "S1":
+                    # appended unconditionally so it stays the same length as 'filenames'
+                    metadata[satname]["band_order"].append(
+                        get_band_order_from_meta(meta_info)
+                    )
                 # if the metadata file didn't contain im_height or im_width set this as an empty list
                 if meta_info["im_height"] == -1 or meta_info["im_height"] == -1:
                     metadata[satname]["im_dimensions"].append([])
@@ -2751,8 +2896,86 @@ def get_metadata(inputs: dict) -> dict:
 ###################################################################################################
 
 
+def get_downloaded_sar_polarizations(inputs: dict, metadata_s1: dict) -> dict:
+    """
+    Maps each already-downloaded Sentinel-1 date to the polarizations present for it.
+
+    Prefers what is actually on disk - get_filenames returns only files that exist - and
+    falls back to the 'band_order' recorded in the metadata when the files cannot be
+    listed. Reading the disk means a scene whose VV was deleted by hand is correctly seen
+    as incomplete.
+
+    Args:
+        inputs (dict): must contain 'filepath' and 'sitename'.
+        metadata_s1 (dict): the 'S1' entry of the metadata dict, whose 'dates',
+            'filenames' and 'band_order' lists are index-aligned.
+
+    Returns:
+        dict: {date: set of polarizations present}
+    """
+    try:
+        filepath = SDS_tools.get_filepath(inputs, "S1")
+    except Exception:
+        filepath = None
+
+    dates = metadata_s1.get("dates", [])
+    filenames = metadata_s1.get("filenames", [])
+    band_orders = metadata_s1.get("band_order", [])
+
+    by_date = {}
+    for index, date in enumerate(dates):
+        present = set()
+        if filepath and index < len(filenames):
+            try:
+                for file_path in SDS_tools.get_filenames(
+                    filenames[index], filepath, "S1"
+                ):
+                    polar = SDS_tools.get_polarization_from_filename(file_path)
+                    if polar:
+                        present.add(polar)
+            except (FileNotFoundError, IOError, IndexError):
+                present = set()
+        if not present and index < len(band_orders):
+            # no readable files, trust what the metadata says was downloaded
+            bands = band_orders[index]
+            if isinstance(bands, str):
+                bands = [bands]
+            present = {str(b).strip().upper() for b in bands if str(b).strip()}
+        by_date.setdefault(date, set()).update(present)
+
+    return by_date
+
+
+def get_incomplete_sar_dates(
+    inputs: dict, metadata_s1: dict, polarizations: list
+) -> set:
+    """
+    Dates of downloaded Sentinel-1 scenes that are missing a requested polarization.
+
+    Those scenes have to be downloaded again on a resume, or a site first downloaded as
+    VH-only would stay single-polarization forever and never reach the segmentation
+    model, which needs both VV and VH.
+
+    Args:
+        inputs (dict): must contain 'filepath' and 'sitename'.
+        metadata_s1 (dict): the 'S1' entry of the metadata dict.
+        polarizations (list): the polarizations requested for this run.
+
+    Returns:
+        set: dates whose scene does not carry every requested polarization
+    """
+    requested = {str(polar).strip().upper() for polar in polarizations}
+    return {
+        date
+        for date, present in get_downloaded_sar_polarizations(
+            inputs, metadata_s1
+        ).items()
+        if not requested.issubset(present)
+    }
+
+
 def remove_existing_imagery(
-    image_dict: dict, metadata: dict, sat_list: list[str]
+    image_dict: dict, metadata: dict, sat_list: list[str], inputs: dict
 ) -> dict:
     """
     Removes existing imagery from the image dictionary based on the provided metadata.
@@ -2785,6 +3008,10 @@ def remove_existing_imagery(
                 'S2':{'filenames':[], 'dates':[], 'epsg':[], 'acc_georef':[], 'im_quality':[], 'im_dimensions':[]}
             }
         sat_list (list[str]): A list of satellite names.
+        inputs (dict): the run inputs, giving the requested Sentinel-1 polarizations and
+            where the images live. Required: without it an S1 scene missing a
+            polarization cannot be told apart from a complete one, and the site would
+            silently stay single-polarization on every resume.
 
     Returns:
         dict: The updated image dictionary after removing existing imagery.
@@ -2810,7 +3037,7 @@ def remove_existing_imagery(
             ]
             if len(avail_date_list) == 0:
                 print(
-                    f'{satname}:There are {len(avail_date_list)} images available, {len(metadata[satname]["dates"])} images already exist, {len(avail_date_list)} to download'
+                    f"{satname}:There are {len(avail_date_list)} images available, {len(metadata[satname]['dates'])} images already exist, {len(avail_date_list)} to download"
                 )
                 continue
             downloaded_dates = metadata[satname]["dates"]
@@ -2819,6 +3046,27 @@ def remove_existing_imagery(
                     f"{satname}:There are {len(avail_date_list)} images available, {len(downloaded_dates)} images already exist, {len(avail_date_list)} to download"
                 )
                 continue
+
+            # A Sentinel-1 scene only counts as downloaded once every requested
+            # polarization is there. Matching on the date alone would leave a site that
+            # was first downloaded as VH-only stuck single-polarization on every resume,
+            # and single-polarization scenes cannot be segmented by the model.
+            if satname == "S1":
+                polarizations = get_sentinel1_polarizations(inputs)
+                incomplete_dates = get_incomplete_sar_dates(
+                    inputs, metadata[satname], polarizations
+                )
+                if incomplete_dates:
+                    downloaded_dates = [
+                        date
+                        for date in downloaded_dates
+                        if date not in incomplete_dates
+                    ]
+                    print(
+                        f"{satname}: {len(incomplete_dates)} existing images are missing "
+                        f"one of {'+'.join(polarizations)} and will be downloaded again"
+                    )
+
             # get the indices of the images that are not already downloaded
             idx_new = np.where(
                 [not avail_date in downloaded_dates for avail_date in avail_date_list]

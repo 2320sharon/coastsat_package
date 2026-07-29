@@ -1,44 +1,172 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
-
-# tells setup tools to include the data in the coastsat directory
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-"*"=["*.kml","*.pkl"]
 
 [project]
 name = "coastsat_package"
-dynamic = ["readme"]
-version = "0.4.8"
+version = "0.5.0"
+description = "A packaged version of CoastSat: a global shoreline mapping tool using satellite imagery"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-only"
+license-files = ["LICENSE.md"]
 authors = [
-  { name="Sharon Batiste" },
+  { name = "Sharon Batiste" },
 ]
-# find` directive with `include` or `exclude`
-description = "A packaged version of CoastSat: A Global shoreline mapping tool from satellite imagery"
-dependencies = [ "scikit-image",
-  "earthengine-api>=0.1.304",
-  "jupyterlab>=3.0.0",
-  "geopandas",
-  "matplotlib",
-  "astropy",
-  "tqdm",
-  "importlib-resources",
-  "pyqt5",
-  "scipy",
-  "numpy",
-  "imageio",
-  "scikit-learn"]
-license = { file="LICENSE" }
-requires-python = ">=3.8"
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+  # GDAL is intentionally NOT declared here even though SDS_tools.py and
+  # SDS_preprocess.py do `from osgeo import gdal`: GDAL publishes no wheels on
+  # PyPI, so declaring it makes plain `pip install` attempt a source build that
+  # fails on most machines. Install it from conda-forge instead.
+  "astropy",
+  "earthengine-api>=0.1.304",
+  "geopandas",
+  "google-auth",
+  "imageio",
+  "importlib-resources",
+  "joblib",
+  "matplotlib",
+  # Floored to match [tool.pixi.dependencies]. A pip-only install that resolved numpy 1.x
+  # would fail to unpickle the reference-shoreline .pkl files, which reference `numpy._core`.
+  "numpy>=2",
+  "onnxruntime",
+  "pandas",
+  "Pillow",
+  "pooch",
+  "PyQt5",
+  "pytz",
+  "requests",
+  "scikit-image>=0.25",
+  "scikit-learn",
+  "scipy",
+  "shapely",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+notebook = [
+  "ipykernel",
+  "jupyterlab>=3",
+]
+test = [
+  "pytest>=8",
+  "pytest-cov>=5",
+]
+dev = [
+  "build>=1.2",
+  "pytest>=8",
+  "pytest-cov>=5",
+  "ruff>=0.9",
+  "twine>=5",
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/SatelliteShorelines/coastsat_package"
+Homepage = "https://github.com/SatelliteShorelines/coastsat_package"
+Repository = "https://github.com/SatelliteShorelines/coastsat_package"
 "Bug Tracker" = "https://github.com/SatelliteShorelines/coastsat_package/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["tests_archive_*", "data", "dist", "build", ".pixi", "*.egg-info"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+markers = [
+  "perf: long-running performance benchmark; deselect with -m 'not perf'",
+]
+xfail_strict = true
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["coastsat*"]
+
+[tool.setuptools.package-data]
+"coastsat.classification.models" = ["*.pkl"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+channel-priority = "strict"
+platforms = ["linux-64", "win-64", "osx-64", "osx-arm64"]
+
+# Tells Pixi which conda package satisfies which PyPI requirement, so the
+# [project] dependencies above are resolved from conda-forge rather than being
+# re-downloaded as wheels. 
+[tool.pixi.workspace.conda-pypi-map]
+conda-forge = "conda-pypi-map.json"
+
+[tool.pixi.dependencies]
+python = "3.11.*"
+astropy = "*"
+earthengine-api = ">=0.1.304"
+gdal = "*"
+geopandas = "*"
+google-auth = "*"
+imageio = "*"
+importlib_resources = "*"
+joblib = "*"
+matplotlib = "*"
+numpy = ">=2"
+onnxruntime = { version = "*", build = "*cpu*" }
+pandas = "*"
+pillow = "*"
+pooch = "*"
+pyqt = "5.15.*"
+pytz = "*"
+requests = "*"
+scikit-image = ">=0.25"
+scikit-learn = "*"
+scipy = "*"
+shapely = "*"
+tqdm = "*"
+
+# Install this repository itself in editable mode.
+[tool.pixi.pypi-dependencies]
+coastsat-package = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+auth = "earthengine authenticate"
+smoke = "python -c \"import coastsat, ee, geopandas, numpy, pandas, PyQt5; from osgeo import gdal; print('CoastSat environment OK')\""
+test = { cmd = "pixi run -e test pytest", env = { MPLBACKEND = "Agg" } }
+test-cov = { cmd = "pixi run -e test pytest --cov=coastsat --cov-report=term-missing", env = { MPLBACKEND = "Agg" } }
+
+[tool.pixi.feature.notebook.dependencies]
+ipykernel = "*"
+jupyterlab = ">=3"
+
+[tool.pixi.feature.notebook.tasks]
+lab = "jupyter lab"
+
+[tool.pixi.feature.test.dependencies]
+pytest = ">=8"
+pytest-cov = ">=5"
+
+[tool.pixi.feature.dev.dependencies]
+# conda-forge ships the PyPI "build" package under the name "python-build"
+python-build = ">=1.2"
+ruff = ">=0.9"
+twine = ">=5"
+
+[tool.pixi.feature.dev.tasks]
+lint = "ruff check src tests"
+format = "ruff format src tests"
+build-package = "python -m build"
+check-package = "twine check dist/*"
+
+[tool.pixi.environments]
+default = { features = [], solve-group = "coastsat" }
+notebook = { features = ["notebook"], solve-group = "coastsat" }
+test = { features = ["test"], solve-group = "coastsat" }
+# A superset of every other environment. The shared solve-group means the pytest run here
+# and in the `test` environment use identical package versions.
+dev = { features = ["notebook", "test", "dev"], solve-group = "coastsat" }
