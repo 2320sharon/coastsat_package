@@ -119,37 +119,39 @@ include-package-data = true
 where = ["src"]
 include = ["coastsat*"]
 
-[tool.setuptools.package-data]
-# The Sentinel-1 segmentation model (SAR_3_band_model.onnx, ~130 MB) is NOT
-# shipped -- it exceeds PyPI's file-size limit and is downloaded on demand by
-# SDS_sar_model.fetch_default_sar_model().
-coastsat = [
-  "*.kml",
-  "*.pkl",
-  "**/*.kml",
-  "**/*.pkl",
-]
-
-# The two CoastSat_training_set_*.pkl files are 32.2 MB of a 32.9 MB wheel and
-# nothing at runtime reads them -- SDS_shoreline imports the `training_data`
-# package but never uses the name, and the classifiers actually loaded are
-# classification/models/NN_4classes_*.pkl. Only train_new_classifier.ipynb wants
-# them, and it resolves paths from os.getcwd(), so it needs a checkout anyway.
-# They stay in git; MANIFEST.in keeps them out of the sdist and this table keeps
-# them out of the wheel.
+# Names the two payloads the library actually loads, one package at a time.
 #
-# BOTH keys are required -- setuptools offers these files to the wheel twice and
-# an exclusion only applies to the package currently being processed:
-#   1. as data of `coastsat`, pulled in by the "**/*.pkl" glob above, which
-#      recurses into subdirectories;
-#   2. as data of `coastsat.classification.training_data`, which packages.find
-#      discovers as a package in its own right.
-# Dropping either key silently ships the files again. The dotted key MUST be
-# quoted or TOML reads the dots as nested tables -- also silent.
-# Patterns are relative to each key's own package directory, which is why the
-# two entries look different.
+# Deliberately NOT the recursive globs this used to carry ("*.pkl" plus "**/*.pkl" on
+# `coastsat`). Those swept in every .pkl under the package, including the 32.2 MB of
+# CoastSat_training_set_*.pkl in classification/training_data/ that nothing at runtime
+# reads -- SDS_shoreline imports the `training_data` package but never uses the name, and
+# the classifiers it loads are classification/models/NN_4classes_*.pkl. Undoing that sweep
+# took a pair of exclude-package-data keys that both had to survive every future edit, so
+# the training sets rode a broad include and a narrow correction. Listing each package
+# instead keeps them out by construction: nothing offers them, so nothing has to remove
+# them.
+#
+# The Sentinel-1 segmentation model (SAR_3_band_model.onnx, ~130 MB) is not shipped either
+# -- it exceeds PyPI's file-size limit and SDS_sar_model.fetch_default_sar_model()
+# downloads it on demand. MANIFEST.in excludes it from the sdist.
+#
+# Keys are dotted package names and MUST be quoted, or TOML reads the dots as nested
+# tables and the entry silently does nothing. Patterns are relative to each package's own
+# directory.
+[tool.setuptools.package-data]
+"coastsat.classification.models" = ["*.pkl"]
+"coastsat.classification.training_sites" = ["*.kml"]
+
+# The training sets live in git and nowhere else -- not in the wheel, not in the sdist.
+# train_new_classifier.ipynb is their only consumer and it resolves paths from
+# os.getcwd(), so it needs a checkout regardless.
+#
+# This is a backstop, not the primary mechanism. include-package-data = true means the
+# wheel also picks up whatever MANIFEST.in puts in the sdist, so the authoritative
+# exclusion is the `recursive-exclude ... training_data *.pkl` line in MANIFEST.in, which
+# is what keeps them out of BOTH artifacts. This key independently blocks the wheel half
+# if that line is ever lost. ci/check_dist.py asserts the outcome on both artifacts.
 [tool.setuptools.exclude-package-data]
-coastsat = ["classification/training_data/*.pkl"]
 "coastsat.classification.training_data" = ["*.pkl"]
 
 # Pixi reads standard [project] dependencies as PyPI requirements. The
@@ -224,7 +226,10 @@ smoke = "python -c \"import coastsat, ee, geopandas, numpy, pandas, PyQt5; from 
 # environment. Trailing arguments are appended by pixi at both hops, so
 # `pixi run test tests/test_sar_model.py -k fetch` reaches pytest intact.
 # MPLBACKEND keeps matplotlib headless -- it is inherited by the inner invocation.
-test = { cmd = "pixi run -e test pytest -q", env = { MPLBACKEND = "Agg" } }
+# No -q here on purpose: pytest verbosity is a counter, so a baked-in -q would make
+# `pixi run test -v` land on plain default output and force -vv for verbose. Pass -q
+# yourself for quiet, or set it in the addopts above to make it the project default.
+test = { cmd = "pixi run -e test pytest", env = { MPLBACKEND = "Agg" } }
 test-cov = { cmd = "pixi run -e test pytest --cov=coastsat --cov-report=term-missing", env = { MPLBACKEND = "Agg" } }
 
 [tool.pixi.feature.notebook.dependencies]

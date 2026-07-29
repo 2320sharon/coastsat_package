@@ -73,13 +73,22 @@ FORBIDDEN = [
     # Scratch modules that `graft src` would otherwise happily package.
     ("*_no_use.py", "scratch module"),
     ("coastsat/tests/*", "tests are not part of the distribution"),
-    # The two CoastSat_training_set_*.pkl files are 32.2 MB and nothing reads them at
-    # runtime. They are dropped by [tool.setuptools.exclude-package-data], which needs BOTH
-    # of its keys to work -- losing either one silently ships them again, which is exactly
-    # what this pattern is here to catch.
+    # The CoastSat_training_set_*.pkl files are 32.2 MB, nothing reads them at runtime, and
+    # they are meant to exist in git only.
     (
         "coastsat/classification/training_data/*.pkl",
-        "training sets are excluded via [tool.setuptools.exclude-package-data]",
+        "the training sets are git-only and must not ship",
+    ),
+]
+
+# The same rule for the sdist. "git only" means absent from both artifacts, and the sdist
+# half is enforced by MANIFEST.in rather than by pyproject.toml, so it needs its own check
+# -- a wheel-only assertion would pass happily while `pip install` from source pulled 32 MB.
+SDIST_FORBIDDEN = [
+    ("*.onnx", "the SAR model is fetched at runtime, never shipped"),
+    (
+        "*/src/coastsat/classification/training_data/*.pkl",
+        "the training sets are git-only and must not ship",
     ),
 ]
 
@@ -136,6 +145,11 @@ def main(dist_dir: str = "dist") -> None:
     for want in SDIST_REQUIRED:
         if not any(n.endswith("/" + want) for n in sdist_names):
             fail(f"{want} missing from the sdist")
+
+    for pattern, reason in SDIST_FORBIDDEN:
+        hits = sorted(n for n in sdist_names if fnmatch.fnmatch(n, pattern))
+        if hits:
+            fail(f"{pattern} must not ship in the sdist ({reason}):\n  " + "\n  ".join(hits))
 
     print(f"wheel  {os.path.basename(wheel)}  {size_mb:.2f} MB  {len(names)} entries")
     print(f"sdist  {os.path.basename(sdist)}  {len(sdist_names)} entries")
