@@ -1,0 +1,274 @@
+# Runs the unit suite on every supported interpreter and OS, then gates the release
+# artifacts. This is the check to look at before tagging a release.
+#
+# Every leg is a conda environment rather than actions/setup-python because GDAL publishes no
+# wheels on PyPI, and SDS_tools.py, SDS_preprocess.py and gdal_merge.py all do
+# `from osgeo import gdal` at module scope -- a pip-only runner cannot import a single
+# coastsat submodule, never mind run the nine test files that use GDAL directly.
+#
+# No credentials are needed. Nothing in tests/ calls ee.Initialize or ee.Authenticate:
+# ee.Filter is monkeypatched where it is exercised and download_S1_image is stubbed. Tests
+# that would need real assets self-skip -- test_sar_model_integration.py on the absent 130 MB
+# .onnx, test_cloud_coverage.py on an absent data/ folder -- and `-ra` in the pytest addopts
+# makes those skips visible in the log rather than silent.
+name: Tests
+
+on:
+  push:
+    branches:
+      - master
+      - "release_*"
+      - "release/**"
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+a[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+b[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+rc[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+dev[0-9]+"
+  pull_request:
+    branches:
+      - master
+      - "release_*"
+      - "release/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Supersede in-flight runs on a pull request, but never abandon a run on master or on a
+# release tag -- those are the ones whose result gets recorded against a published artifact.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      # One broken interpreter should not hide the state of the other eleven.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Floor matches requires-python in pyproject.toml. 3.9 is deliberately absent:
+        # scikit-image 0.25, which the numpy>=2 floor depends on, dropped it.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    defaults:
+      run:
+        # A login shell is required so the micromamba shell hook gets sourced; on
+        # windows-latest this is Git Bash, whose profile chain picks the hook up too. The -e
+        # is not optional: overriding `shell:` discards GitHub's default `-eo pipefail`, so
+        # without it a failing command in a multi-line `run:` block is masked whenever it is
+        # not the last one.
+        shell: bash -el {0}
+    env:
+      # SDS_download, SDS_tools, SDS_shoreline, SDS_transects and SDS_plotting all import
+      # matplotlib.pyplot at module scope. Without this, matplotlib picks an interactive
+      # backend on macOS (MacOSX) and Windows (QtAgg, since the conda `matplotlib`
+      # metapackage pulls pyqt) and hangs or errors on a headless runner.
+      MPLBACKEND: Agg
+      # Only meaningful on Linux, and inert elsewhere because MPLBACKEND=Agg means Qt is
+      # never loaded at all. Kept for parity with the pixi `test-suite` task.
+      QT_QPA_PLATFORM: offscreen
+      # Windows runners default to cp1252 and several tests round-trip text through tmp_path.
+      # Make all three platforms agree on UTF-8.
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ci/environment.yml deliberately leaves most specs open, so a cache keyed only on its
+      # hash would freeze the resolved dependency set indefinitely and CI would stop noticing
+      # upstream breakage -- the main thing a matrix like this is for. Rotating the key
+      # weekly means one cold solve per leg per week and fresh packages after it.
+      - name: Compute weekly cache bucket
+        id: bucket
+        run: echo "week=$(date -u +'%Y-%V')" >> "$GITHUB_OUTPUT"
+
+      - name: Provision the conda environment
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: ci/environment.yml
+          environment-name: coastsat-ci
+          # This is what lets one environment file serve all twelve legs.
+          # ci/environment.yml has no `python` entry precisely so this can vary.
+          create-args: >-
+            python=${{ matrix.python-version }}
+          condarc: |
+            channels:
+              - conda-forge
+            channel_priority: strict
+          cache-environment: true
+          cache-environment-key: >-
+            micromamba-${{ runner.os }}-${{ runner.arch }}-py${{ matrix.python-version }}-${{ hashFiles('ci/environment.yml') }}-${{ steps.bucket.outputs.week }}
+          cache-downloads: true
+          init-shell: bash
+          # Leave the environment in place so cache-environment has something to save.
+          post-cleanup: none
+
+      - name: Environment report
+        run: |
+          micromamba info
+          micromamba list
+
+      # --no-deps is load-bearing, not hygiene. Without it pip re-resolves all of
+      # [project].dependencies from PyPI and reinstalls numpy, scipy, scikit-image and
+      # shapely wheels over the conda builds. The conda GDAL bindings are compiled against a
+      # specific numpy AND CPython ABI (build strings look like np2py311...), so a mixed
+      # environment breaks `from osgeo import gdal` in nine test files in a way that reads
+      # like a coastsat bug. Build isolation is left on: it fetches setuptools/wheel into a
+      # throwaway venv and never touches this environment.
+      - name: Install the checkout without disturbing the conda stack
+        run: python -m pip install --no-deps -e .
+
+      # Fail here in two seconds with a legible message, rather than nine files into pytest.
+      - name: Verify the GDAL bindings load against this numpy
+        run: |
+          python -c "
+          import sys, numpy
+          from osgeo import gdal, osr
+          print('python', sys.version.split()[0])
+          print('gdal  ', gdal.__version__)
+          print('numpy ', numpy.__version__)
+          "
+
+      # ci/environment.yml restates [tool.pixi.dependencies] by hand, because pixi.lock pins a
+      # single interpreter and cannot drive this matrix. Without this check the two lists
+      # drift silently and CI keeps passing against an environment nobody develops in.
+      # Gated to 3.11 because tomllib is stdlib only from 3.11.
+      - name: Check ci/environment.yml matches pyproject.toml
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: |
+          python -m pip install --no-deps --quiet pyyaml
+          python ci/check_env_sync.py
+
+      - name: Syntax and undefined-name check
+        # Deliberately narrower than the pixi `lint` task (`ruff check src tests`), which
+        # reports hundreds of style findings on this codebase and so cannot gate a merge.
+        # This subset -- syntax errors, undefined names, always-false assertions -- passes
+        # clean today and catches the class of mistake that makes a module unimportable.
+        # Widen it once the backlog is cleared.
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: |
+          python -m pip install --no-deps --quiet ruff
+          ruff check --isolated --select E9,F63,F7,F82 src tests
+
+      # Options live in [tool.pytest.ini_options]: testpaths keeps collection inside tests/
+      # (the root-level test_*.py and example_*.py scripts call ee.Initialize() at import),
+      # norecursedirs keeps it out of tests_archive_*, and --strict-markers/--strict-config
+      # turn typos into errors.
+      - name: Run the test suite
+        run: python -m pytest --durations=15 --cov=coastsat --cov-report=xml --cov-report=term-missing:skip-covered
+
+      - name: Upload coverage
+        if: always() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  release-gate:
+    # Packaging bugs -- a mis-specified data glob, a dependency that cannot install from its
+    # own metadata -- are invisible to the source-tree tests above and only surface after a
+    # tag is published. This job builds the real artifacts and installs them the way a user
+    # would.
+    name: Release gate (build, twine, wheel install)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash -el {0}
+    env:
+      MPLBACKEND: Agg
+      QT_QPA_PLATFORM: offscreen
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Plain CPython, no conda: the build backend must not depend on anything the dev
+      # environment happens to provide.
+      - name: Set up Python for building
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Build sdist and wheel
+        run: python -m build --sdist --wheel --outdir dist/ .
+
+      - name: Check distribution metadata
+        run: twine check --strict dist/*
+
+      - name: Check distribution contents
+        run: python ci/check_dist.py dist/
+
+      # A brand-new environment holding nothing but an interpreter, GDAL and pip. GDAL has to
+      # come from conda; everything else must be pulled in by the wheel's own metadata, which
+      # is precisely what this tests. conda's gdal depends on numpy and ships a real
+      # dist-info, so pip sees numpy as already satisfied and leaves the conda build -- and
+      # its ABI contract with osgeo -- alone.
+      - name: Create a clean environment with GDAL only
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: wheel-smoke
+          create-args: >-
+            python=3.11
+            gdal
+            pip
+          condarc: |
+            channels:
+              - conda-forge
+            channel_priority: strict
+          init-shell: bash
+          post-cleanup: none
+
+      - name: Install the built wheel from its own metadata
+        run: |
+          micromamba activate wheel-smoke
+          python -m pip install --upgrade pip
+          # --only-binary=:all: turns "this dependency has no wheel" into an immediate,
+          # legible failure instead of a ten-minute source build that fails anyway.
+          python -m pip install --only-binary=:all: dist/*.whl
+          python -m pip list
+
+      - name: Smoke-test the installed package
+        # Run from outside the checkout so a stray sys.path entry cannot let src/ satisfy the
+        # imports; --require-installed asserts the wheel is what actually got imported.
+        run: |
+          micromamba activate wheel-smoke
+          python "$GITHUB_WORKSPACE/ci/smoke_test.py" --require-installed
+        working-directory: ${{ runner.temp }}
+
+      # Kept separate so a scikit-learn unpickling regression is unambiguous and never gets
+      # mistaken for a packaging failure. These are MLPClassifier pickles from 2019-2023 and
+      # SDS_shoreline.load_model() does exactly this at runtime, so a failure here is a real
+      # bug rather than a CI problem.
+      - name: Unpickle a packaged classifier
+        run: |
+          micromamba activate wheel-smoke
+          python -c "
+          import os, joblib
+          from coastsat import SDS_shoreline
+          path = os.path.join(SDS_shoreline.get_model_locations(), 'NN_4classes_S2_new.pkl')
+          clf = joblib.load(path)
+          print(type(clf).__name__, 'n_features_in_ =', getattr(clf, 'n_features_in_', '?'))
+          "
+        working-directory: ${{ runner.temp }}
+
+      - name: Upload distributions
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+          # Wheels and sdists are already compressed; re-zipping only costs time.
+          compression-level: 0
