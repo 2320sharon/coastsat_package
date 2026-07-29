@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 import numpy as np
 import matplotlib
@@ -10,6 +10,13 @@ from matplotlib.colors import ListedColormap
 
 
 from coastsat import SDS_preprocess, SDS_tools
+
+# Colour the reference shoreline buffer actually renders as. The buffer is drawn as an
+# all-True masked array under cmap="PiYG", which normalises to 0.0 and so takes the
+# bottom of the colormap - the pink end, not the green one. The legend swatch has to
+# match what is on the image or it points the reader at the wrong thing.
+REF_BUFFER_COLOR = "#8e0152"
+REF_BUFFER_ALPHA = 0.6
 
 
 def transform_shoreline_area_to_pixel_coords(
@@ -88,6 +95,8 @@ def plot_detection(
     output_directory: Optional[str] = None,
     shoreline_extraction_area: Optional[np.ndarray] = None,
     is_sar: bool = False,
+    band_index: int = 0,
+    class_labels: Tuple[str, str] = ("Otsu class 1", "Otsu class 2"),
 ):
     """
     Unified function for plotting shoreline detection on SAR and optical images.
@@ -107,6 +116,8 @@ def plot_detection(
     - output_directory: str - path to store outputs
     - shoreline_extraction_area: list[np.array] - area outlines
     - is_sar: bool - whether the input is SAR imagery
+    - band_index: int - SAR only, which channel of im_ms to display
+    - class_labels: tuple[str, str] - SAR only, what im_labels == 0 and == 1 mean
 
     Returns
         bool: True if the user accepted the detections, False otherwise.
@@ -139,6 +150,8 @@ def plot_detection(
             output_path,
             settings,
             shoreline_extraction_area=shoreline_extraction_area_pix,
+            band_index=band_index,
+            class_labels=class_labels,
         )
     else:
         return plot_optical_detection(
@@ -213,13 +226,23 @@ def plot_sar_detection(
     output_path: str,
     settings: Dict[str, Any],
     shoreline_extraction_area: List[np.ndarray],
+    band_index: int = 0,
+    class_labels: Tuple[str, str] = ("Otsu class 1", "Otsu class 2"),
 ) -> bool:
     """
-    Plots SAR detection results including grayscale image, shoreline pixels,
-    labeled water/land areas, and an optional reference shoreline buffer.
+    Plots SAR detection results as three panels, left to right:
+
+        1. the SAR imagery with the detected shoreline
+        2. the same, plus the land/water segmentation the shoreline was traced from
+        3. the same as 2, plus the reference shoreline buffer that restricted the
+           search, overlaid as plot_optical_detection draws it
+
+    Panel 3 repeats panel 2 on purpose: it is the only way to see whether the buffer
+    cut through the segmentation, without the buffer obscuring the segmentation in the
+    panel used to judge it.
 
     Args:
-        im_ms (np.ndarray): Multispectral or grayscale image to display.
+        im_ms (np.ndarray): SAR image to display, one channel per polarization.
         im_labels (np.ndarray): Labeled image (typically from Otsu thresholding).
         sl_pix (np.ndarray): Array of shoreline pixel coordinates (Nx2).
         date (str): Date string for display and file naming.
@@ -228,72 +251,81 @@ def plot_sar_detection(
         output_path (str): Directory path to save the figure if enabled.
         settings (Dict[str, Any]): Dictionary of settings. Must contain key 'save_figure'.
         shoreline_extraction_area (list[np.ndarray]): The shoreline extraction area in pixel coordinates.
+        band_index (int): Which channel (polarization) of im_ms to display.
+        class_labels (tuple[str, str]): What im_labels == 0 and im_labels == 1 mean, for
+            the legend. The two segmentation methods label opposite classes: Otsu marks
+            the high-backscatter class (land) as 1, the model marks water as 1.
 
     Returns:
         bool: Always returns False. Used as a placeholder return value.
     """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7), gridspec_kw={"wspace": 0.05})
+    fig = plt.figure(figsize=(18, 9))
+    gs = gridspec.GridSpec(1, 3)
+    ax1, ax2, ax3 = [fig.add_subplot(gs[0, i]) for i in range(3)]
 
-    im_display = _normalize_grayscale(im_ms)
+    # Reduce to a single polarization before normalising: imshow only accepts 1, 3 or 4
+    # channels, and the percentiles would otherwise be taken over a mix of polarizations
+    # whose dB distributions differ.
+    im_band = im_ms[:, :, band_index] if im_ms.ndim == 3 else im_ms
+    im_display = _normalize_grayscale(im_band)
 
-    # Left panel
+    # A buffer covering the whole image means no reference shoreline was given, so it
+    # constrains nothing. Drawing it would just tint the entire panel.
+    show_ref_buffer = im_ref_buffer is not None and not np.all(im_ref_buffer)
+
+    # Left: the imagery on its own, so the detected shoreline can be judged against it
     ax1.imshow(im_display, cmap="gray")
-    if im_ref_buffer is not None:
-        mask = np.ma.masked_where(im_ref_buffer == False, im_ref_buffer)
-        ax1.imshow(mask, cmap="PiYG", alpha=0.6)
-    ax1.plot(sl_pix[:, 0], sl_pix[:, 1], "r.", markersize=1)
-    for area in shoreline_extraction_area:
-        ax1.plot(
-            area[:, 0],
-            area[:, 1],
-            color="#cb42f5",
-            markersize=1,
-        )
+    _draw_sar_shoreline(ax1, sl_pix, shoreline_extraction_area)
     ax1.set_title(date)
     ax1.axis("off")
 
-    # Right panel
+    # Middle: the segmentation the shoreline was traced from
     ax2.imshow(im_display, cmap="gray")
-    ax2.imshow(
-        im_labels.astype(int), cmap=ListedColormap(["yellow", "blue"]), alpha=0.3
-    )
-    if im_ref_buffer is not None:
-        ax2.imshow(
-            np.ma.masked_where(~im_ref_buffer, im_ref_buffer), cmap="PiYG", alpha=0.5
-        )
-    ax2.plot(sl_pix[:, 0], sl_pix[:, 1], "r.", markersize=1)
-    for area in shoreline_extraction_area:
-        ax2.plot(
-            area[:, 0],
-            area[:, 1],
-            color="#cb42f5",
-            markersize=1,
-        )
+    _draw_sar_classes(ax2, im_labels)
+    _draw_sar_shoreline(ax2, sl_pix, shoreline_extraction_area)
     ax2.set_title(satname)
     ax2.axis("off")
 
-    # Add extra space between plots and place legend fully outside
-    plt.subplots_adjust(left=0.05, right=0.95, wspace=0.2)
+    # Right: the same, plus the reference shoreline buffer that restricted the search,
+    # drawn the way plot_optical_detection draws it
+    ax3.imshow(im_display, cmap="gray")
+    _draw_sar_classes(ax3, im_labels)
+    if show_ref_buffer:
+        ax3.imshow(
+            np.ma.masked_where(im_ref_buffer == False, im_ref_buffer),
+            cmap="PiYG",
+            alpha=REF_BUFFER_ALPHA,
+        )
+        ax3_title = "reference shoreline buffer"
+    else:
+        ax3_title = "no reference shoreline (whole image searched)"
+    _draw_sar_shoreline(ax3, sl_pix, shoreline_extraction_area)
+    ax3.set_title(ax3_title)
+    ax3.axis("off")
 
-    # Legend placed in figure coordinates outside the plot area
-    handles = [
-        mlines.Line2D([], [], color="red", label="Shoreline"),
-        mpatches.Patch(color="red", alpha=0.4, label="Reference shoreline buffer"),
-        mpatches.Patch(color="yellow", label="Otsu class 1"),
-        mpatches.Patch(color="blue", label="Otsu class 2"),
+    handles = [mlines.Line2D([], [], color="red", label="Shoreline")]
+    # the colormap in _draw_sar_classes maps im_labels 0 -> yellow and 1 -> blue
+    handles += [
+        mpatches.Patch(color="yellow", label=class_labels[0]),
+        mpatches.Patch(color="blue", label=class_labels[1]),
     ]
-
+    if show_ref_buffer:
+        handles.append(
+            mpatches.Patch(
+                color=REF_BUFFER_COLOR,
+                alpha=REF_BUFFER_ALPHA,
+                label="reference shoreline buffer",
+            )
+        )
     if shoreline_extraction_area:
         handles.append(
             mlines.Line2D([], [], color="#cb42f5", label="shoreline extraction area")
         )
 
-    fig.legend(
-        handles=handles,
-        loc="center left",
-        bbox_to_anchor=(0.44, 0.5),
-        fontsize=9,
-        frameon=True,
+    # loc must be given with bbox_to_anchor, otherwise it defaults to "best" and the
+    # legend is placed *inside* the panel, on top of the imagery
+    ax3.legend(
+        handles=handles, loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=10
     )
 
     if settings.get("save_figure", False):
@@ -305,6 +337,22 @@ def plot_sar_detection(
 
     plt.close(fig)
     return False
+
+
+def _draw_sar_classes(ax: matplotlib.axes.Axes, im_labels: np.ndarray) -> None:
+    """Overlays the two-class segmentation; 0 -> yellow, 1 -> blue."""
+    ax.imshow(im_labels.astype(int), cmap=ListedColormap(["yellow", "blue"]), alpha=0.3)
+
+
+def _draw_sar_shoreline(
+    ax: matplotlib.axes.Axes,
+    sl_pix: np.ndarray,
+    shoreline_extraction_area: List[np.ndarray],
+) -> None:
+    """Draws the detected shoreline and any extraction-area outlines onto an axis."""
+    ax.plot(sl_pix[:, 0], sl_pix[:, 1], "r.", markersize=1)
+    for area in shoreline_extraction_area:
+        ax.plot(area[:, 0], area[:, 1], color="#cb42f5", markersize=1)
 
 
 def plot_optical_detection(

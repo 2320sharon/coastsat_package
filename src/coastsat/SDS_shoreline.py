@@ -21,7 +21,6 @@ import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
-import scipy
 import sklearn
 from matplotlib import gridspec
 from pylab import ginput
@@ -33,7 +32,7 @@ from skimage.filters import threshold_multiotsu
 from tqdm.auto import tqdm
 
 # local application/library specific imports
-from coastsat import SDS_preprocess, SDS_tools
+from coastsat import SDS_preprocess, SDS_sar_model, SDS_tools
 from coastsat.SDS_tools import create_geometry
 from coastsat.SDS_download import release_logger, setup_logger
 from coastsat.classification import models, training_data, training_sites
@@ -136,14 +135,430 @@ def should_skip_image(
     return False
 
 
-def otsu_threshold(im, min_beach_area):
+# Polarization the SAR shoreline detection thresholds when the scene carries only one
+# usable band. CoastSat has always thresholded VH, so keeping it as the default leaves
+# existing results unchanged now that several polarizations can be stacked into im_ms.
+# A dual-polarization scene thresholds the mean of VV and VH instead, unless
+# settings['sar_detection_polarization'] names a band explicitly.
+SAR_DETECTION_POLARIZATION = "VH"
+
+
+def get_sar_detection_polarization(settings=None):
+    """
+    Returns the polarization settings ask the Otsu path to threshold, or None.
+
+    None means "no explicit request", which leaves the default behaviour of
+    get_sar_otsu_image in place rather than forcing a band.
+
+    Arguments:
+    -----------
+    settings: dict, optional
+        may contain 'sar_detection_polarization', e.g. 'VV'
+
+    Returns:
+    -----------
+    str or None: the requested polarization, upper-cased, or None if unset
+
+    """
+    if not settings:
+        return None
+    polarization = settings.get("sar_detection_polarization")
+    if not polarization:
+        return None
+    return str(polarization).strip().upper()
+
+
+def warn_unknown_sar_detection_polarization(settings, logger=None):
+    """
+    Warns once per run when settings ask for a polarization CoastSat cannot download.
+
+    A typo would otherwise be indistinguishable from the default, because a request this
+    code cannot honour falls back to the usual band (see get_sar_otsu_image).
+
+    Arguments:
+    -----------
+    settings: dict
+        may contain 'sar_detection_polarization'
+    logger: logging.Logger, optional
+
+    Returns:
+    -----------
+    str or None: the requested polarization, as get_sar_detection_polarization returns it
+
+    """
+    requested = get_sar_detection_polarization(settings)
+    if (
+        requested is not None
+        and requested not in SDS_tools.SAR_POLARIZATIONS
+        and logger is not None
+    ):
+        logger.warning(
+            f"S1: settings['sar_detection_polarization'] is '{requested}', which is not "
+            f"one of {list(SDS_tools.SAR_POLARIZATIONS)}; the Otsu fallback will "
+            "threshold the usual band instead"
+        )
+    return requested
+
+
+def get_sar_channel_bands(fn):
+    """
+    Returns what each channel of im_ms holds, as preprocess_image built it.
+
+    For a dual-polarization scene preprocess_image replaces the raw polarization stack
+    with the [VV, VH, VV-VH] composite, so the channels are the composite bands and no
+    longer line up one-to-one with `fn`. Otherwise the channels are the polarizations of
+    `fn`, in that order.
+
+    Arguments:
+    -----------
+    fn: str or list of str
+        the image file(s) of the scene, as returned by SDS_tools.get_filenames
+
+    Returns:
+    -----------
+    list: the band held by each channel of im_ms
+
+    """
+    if isinstance(fn, str):
+        fn = [fn]
+    polarizations = [SDS_tools.get_polarization_from_filename(f) for f in fn]
+
+    if "VV" in polarizations and "VH" in polarizations:
+        return list(SDS_tools.SAR_COMPOSITE_BANDS)
+    return polarizations
+
+
+def get_sar_band_index(fn, polarization: str = SAR_DETECTION_POLARIZATION) -> int:
+    """
+    Returns the channel of im_ms holding the polarization used for SAR detection.
+
+    `fn` is the list of files read_sar_image() stacked, so its order is the channel
+    order. Falls back to the first channel when the polarization is not present,
+    which covers scenes downloaded before multi-polarization support.
+
+    Arguments:
+    -----------
+    fn: str or list of str
+        the image file(s) of the scene, as returned by SDS_tools.get_filenames
+    polarization: str
+        polarization to threshold, defaults to VH
+
+    Returns:
+    -----------
+    int: index of the channel to threshold
+
+    """
+    if isinstance(fn, str):
+        fn = [fn]
+    for index, file_path in enumerate(fn):
+        if SDS_tools.get_polarization_from_filename(file_path) == polarization:
+            return index
+    return 0
+
+
+def get_sar_otsu_image(im_ms, fn, settings=None):
+    """
+    Returns the 2D image the SAR Otsu threshold runs on.
+
+    For a dual-polarization scene im_ms is the [VV, VH, VV-VH] composite and the
+    threshold runs on the mean of VV and VH (in dB). Note VV-VH is deliberately left
+    out of that mean: VV + VH + (VV - VH) = 2*VV, so including it would cancel VH
+    and reduce the result to a rescaling of VV alone.
+
+    Scenes with a single polarization, i.e. those downloaded before dual-polarization
+    support, keep thresholding that one band so their results are unchanged.
+
+    settings['sar_detection_polarization'] overrides both: it thresholds that band
+    directly whenever the scene carries it. A scene that does not carry it falls back to
+    the behaviour above rather than failing, so one odd scene in a run still maps.
+
+    Arguments:
+    -----------
+    im_ms: np.ndarray
+        (H, W, n) composite or polarization stack, as returned by preprocess_image
+    fn: str or list of str
+        the image file(s) of the scene, used to identify the polarizations
+    settings: dict, optional
+        may contain 'sar_detection_polarization' to threshold one band explicitly
+
+    Returns:
+    -----------
+    np.ndarray: the (H, W) image to threshold
+
+    """
+    bands = get_sar_channel_bands(fn)
+
+    requested = get_sar_detection_polarization(settings)
+    if requested is not None and requested in bands:
+        return im_ms[:, :, bands.index(requested)]
+
+    if "VV" in bands and "VH" in bands:
+        return (im_ms[:, :, bands.index("VV")] + im_ms[:, :, bands.index("VH")]) / 2.0
+
+    return im_ms[:, :, get_sar_band_index(fn)]
+
+
+def describe_sar_otsu_image(fn, settings=None) -> str:
+    """
+    Describes what get_sar_otsu_image() returns for `fn`, for logging.
+
+    Reports the band actually thresholded, so a 'sar_detection_polarization' the scene
+    does not carry is visible in the log as the band that replaced it.
+    """
+    bands = get_sar_channel_bands(fn)
+
+    requested = get_sar_detection_polarization(settings)
+    if requested is not None and requested in bands:
+        return requested
+
+    if "VV" in bands and "VH" in bands:
+        return "the mean of VV and VH"
+
+    return str(bands[get_sar_band_index(fn)])
+
+
+# How SAR water is segmented: "model" runs the ONNX land/water model on the
+# [VV, VH, VV-VH] composite, "otsu" forces the legacy global threshold. The model is the
+# default; scenes it cannot handle fall back to Otsu on their own (see load_sar_segmenter).
+SAR_SEGMENTATION_DEFAULT = "model"
+
+
+def load_sar_segmenter(settings, logger=None):
+    """
+    Loads the SAR segmentation model once for a whole run, or None to use Otsu.
+
+    Returns None rather than raising whenever the model cannot be used - onnxruntime not
+    installed, the .onnx missing, its download failing offline, settings asking for
+    Otsu - so that a run always produces shorelines, using the legacy threshold where
+    the model is unavailable.
+
+    Arguments:
+    -----------
+    settings: dict
+        may contain 'sar_segmentation' ("model" or "otsu") and 'sar_model_path'
+    logger: logging.Logger, optional
+        records which segmentation method the run will use
+
+    Returns:
+    -----------
+    tuple or None: (onnxruntime session, model spec), or None to threshold with Otsu
+
+    """
+    method = str(settings.get("sar_segmentation", SAR_SEGMENTATION_DEFAULT)).lower()
+
+    if method == "otsu":
+        if logger is not None:
+            logger.info(
+                "S1: settings['sar_segmentation'] is 'otsu', thresholding instead of "
+                "running the segmentation model"
+            )
+        return None
+
+    override = settings.get("sar_model_path")
+    model_path = SDS_sar_model.get_sar_model_path(settings)
+    try:
+        # None means the default model, which load_sar_model may download on first
+        # use; an explicit override path is never downloaded
+        session, spec = SDS_sar_model.load_sar_model(model_path if override else None)
+    except SDS_sar_model.SarModelUnavailable as e:
+        if logger is not None:
+            logger.warning(
+                f"S1: falling back to Otsu thresholding for every scene, because {e}"
+            )
+        return None
+
+    if logger is not None:
+        logger.info(
+            f"S1: segmenting land/water with {os.path.basename(model_path)} "
+            f"(channels {list(spec['channel_order'])})"
+        )
+    return session, spec
+
+
+def segment_sar_water(im_ms, fn, segmenter, settings, logger=None, date_str=""):
+    """
+    Segments water in one SAR scene with the model, or returns None to use Otsu.
+
+    Arguments:
+    -----------
+    im_ms: np.ndarray
+        (H, W, 3) [VV, VH, VV-VH] composite in dB, as returned by preprocess_image
+    fn: list of str
+        the polarization files of the scene, used to read the validity mask
+    segmenter: tuple or None
+        (session, spec) as returned by load_sar_segmenter
+    settings: dict
+        may contain 'sar_water_threshold'
+    logger: logging.Logger, optional
+    date_str: str
+        image date, for the log message
+
+    Returns:
+    -----------
+    tuple or None:
+        np.ndarray: (H, W) boolean water mask
+        np.ndarray: (H, W) boolean validity mask
+        np.ndarray: (H, W) float32 P(water), the probability the mask was cut from
+        or None if the model could not segment this scene
+
+    """
+    if segmenter is None:
+        return None
+
+    session, spec = segmenter
+    try:
+        valid = SDS_tools.read_sar_valid_mask(fn)
+        im_water, im_prob = SDS_sar_model.segment_water(
+            im_ms,
+            valid,
+            session,
+            spec,
+            settings.get("sar_water_threshold", SDS_sar_model.WATER_THRESHOLD),
+        )
+    except SDS_sar_model.SarModelUnavailable as e:
+        if logger is not None:
+            logger.warning(
+                f"S1 {date_str}: falling back to Otsu thresholding, because {e}"
+            )
+        return None
+
+    return im_water, valid, im_prob
+
+
+def save_sar_probability(im_prob, valid, fn, logger=None, date_str=""):
+    """
+    Writes P(water) of a model-segmented scene as a single-band float32 GeoTIFF.
+
+    The raster goes to S1/prob/, a sibling of the polarization folders, named like
+    the scene files with 'prob' in place of the polarization token (the _dupN
+    suffix, when present, is kept so the file pairs up with its scene). It copies
+    the grid of the first polarization file, so it overlays the inputs exactly.
+    Invalid pixels are written as NaN, which is also the declared nodata value -
+    unlike the polarization rasters, where nodata is 0.0, a value P(water) can
+    genuinely take.
+
+    A failure to write is logged and swallowed: the probability raster is a
+    by-product, and losing it must not cost the scene its shoreline.
+
+    Arguments:
+    -----------
+    im_prob: np.ndarray
+        (H, W) P(water), as returned by segment_sar_water
+    valid: np.ndarray
+        (H, W) boolean validity mask; invalid pixels are written as NaN
+    fn: str or list of str
+        the polarization files of the scene, used for the grid and the name
+    logger: logging.Logger, optional
+    date_str: str
+        image date, for the log message
+
+    Returns:
+    -----------
+    str or None: path of the GeoTIFF written, or None if it could not be written
+
+    """
+    from osgeo import gdal
+
+    if isinstance(fn, str):
+        fn = [fn]
+
+    try:
+        source = gdal.Open(fn[0], gdal.GA_ReadOnly)
+        if source is None:
+            raise IOError(f"could not open {fn[0]} to copy its georeferencing")
+
+        prob_dir = os.path.join(os.path.dirname(os.path.dirname(fn[0])), "prob")
+        os.makedirs(prob_dir, exist_ok=True)
+        filename = SDS_tools.swap_polarization_in_filename(
+            os.path.basename(fn[0]), "prob"
+        )
+        prob_path = os.path.join(prob_dir, filename)
+
+        data = np.asarray(im_prob, dtype=np.float32).copy()
+        data[~valid] = np.nan
+
+        driver = gdal.GetDriverByName("GTiff")
+        height, width = data.shape
+        dataset = driver.Create(
+            prob_path,
+            width,
+            height,
+            1,
+            gdal.GDT_Float32,
+            options=["COMPRESS=DEFLATE", "PREDICTOR=3", "TILED=YES"],
+        )
+        dataset.SetGeoTransform(source.GetGeoTransform())
+        dataset.SetProjection(source.GetProjection())
+        band = dataset.GetRasterBand(1)
+        band.SetNoDataValue(float("nan"))
+        band.WriteArray(data)
+        dataset.FlushCache()
+        dataset = None
+        source = None
+    except Exception as e:
+        if logger is not None:
+            logger.warning(
+                f"S1 {date_str}: could not save the P(water) GeoTIFF, because {e}"
+            )
+        return None
+
+    return prob_path
+
+
+def compute_sar_water_fraction(im_water, region):
+    """
+    Fraction of `region` pixels classified as water, or NaN when the region is empty.
+
+    Computed over the reference shoreline buffer (intersected with the valid pixels
+    on the model path): that is where the shoreline is contoured, so a fraction near
+    0 or 1 there means the segmentation found (almost) no land/water interface and
+    the mapped shoreline is suspect. Recorded per scene in output['water_fraction'],
+    which is what the SAR transect QC filters on (see SDS_transects.sar_qc_keep).
+
+    Arguments:
+    -----------
+    im_water: np.ndarray
+        (H, W) boolean water mask, True for water
+    region: np.ndarray
+        (H, W) boolean mask of the pixels to compute the fraction over
+
+    Returns:
+    -----------
+    float: the water fraction in [0, 1], or NaN
+
+    """
+    region = np.asarray(region, dtype=bool)
+    if not np.any(region):
+        return np.nan
+    return float(np.mean(np.asarray(im_water, dtype=bool)[region]))
+
+
+def otsu_threshold(im, min_beach_area_pixels):
+    """
+    Splits a SAR band into land and water with Otsu, dropping the small objects.
+
+    Arguments:
+    -----------
+    im: np.ndarray
+        (H, W) image to threshold, in dB
+    min_beach_area_pixels: int
+        smallest object to keep, in *pixels* - settings['min_beach_area'] is in m^2, so
+        divide it by pixel_size**2 first (see extract_shorelines)
+
+    Returns:
+    -----------
+    tuple:
+        np.ndarray: (H, W) boolean mask, True above the threshold
+        np.ndarray: the Otsu threshold(s), in dB
+
+    """
     # Apply Otsu's thresholding
     threshold = threshold_multiotsu(im, classes=2)  # split into water and land
     otsu = im > min(
         threshold
     )  # only a single threshold but lets pretend there could be more
     otsu_med = morphology.remove_small_objects(
-        otsu, min_size=min_beach_area, connectivity=2
+        otsu, min_size=int(min_beach_area_pixels), connectivity=2
     )
 
     return otsu_med, threshold
@@ -151,7 +566,7 @@ def otsu_threshold(im, min_beach_area):
 
 def find_shoreline_SAR(otsu_image, ref_shoreline_buffer, georef, image_epsg, settings):
     otsu_med_masked = otsu_image.copy().astype(float)
-    otsu_med_masked[~ref_shoreline_buffer] = np.NaN
+    otsu_med_masked[~ref_shoreline_buffer] = np.nan
     contours = measure.find_contours(
         otsu_med_masked, 0.5
     )  # returns lists of np.arrays that are row col formatted example [[[y1,x1],[y2,x2],...], [[[y1,x1],[y2,x2],...]]]
@@ -315,7 +730,14 @@ def preprocess_image(
     apply_cloud_mask = settings.get("apply_cloud_mask", True)
 
     if satname == "S1":
-        im_ms, georef = SDS_tools.read_sar_image(fn[0])
+        # one file per polarization, stacked into one channel each
+        im_ms, georef = SDS_tools.read_sar_image(fn)
+        # when both polarizations are present, work on the [VV, VH, VV-VH] composite
+        im_composite = SDS_tools.build_sar_composite(
+            im_ms, [SDS_tools.get_polarization_from_filename(f) for f in fn]
+        )
+        if im_composite is not None:
+            im_ms = im_composite
         im_nodata = np.zeros(im_ms.shape[:2], dtype=bool)
         cloud_mask = np.zeros(im_ms.shape[:2], dtype=bool)
         return im_ms, georef, cloud_mask, im_nodata
@@ -848,6 +1270,9 @@ def extract_shorelines(
             if True, no pan-sharpening is performed on Landsat 7,8 and 9 imagery
         's2cloudless_prob': float [0,100)
             threshold to identify cloud pixels in the s2cloudless probability mask
+        'sar_save_probability': bool (default: False)
+            if True, saves P(water) of every model-segmented S1 scene as a GeoTIFF
+            in S1/prob/ (see save_sar_probability)
     output_directory: str (default: None)
         The directory to save the output files. If None, the output files will be saved in the same directory as the input files.
     shoreline_extraction_area: gpd.GeoDataFrame (default: None)
@@ -927,6 +1352,10 @@ def extract_shorelines(
             []
         )  # index that were kept during the analysis (cloudy images are skipped)
         output_t_mndwi = []  # MNDWI threshold used to map the shoreline
+        output_segmentation = []  # how each shoreline was derived, and so what
+        # output_t_mndwi holds for it (see SDS_tools.SEGMENTATION_*)
+        output_water_fraction = []  # water fraction in the reference buffer (SAR
+        # only, NaN for optical) - the SAR transect QC quantity
 
         # load classifiers
 
@@ -939,6 +1368,15 @@ def extract_shorelines(
             model_path=filepath_models,
             sklearn_version=sklearn.__version__,
         )
+
+        # load the SAR segmentation model once for the whole satellite, not per scene:
+        # the .onnx is ~130 MB. None means every S1 scene is thresholded with Otsu.
+        sar_segmenter = (
+            load_sar_segmenter(settings, logger=logger) if satname == "S1" else None
+        )
+        if satname == "S1":
+            # a typo here would silently look like the default, so say so once
+            warn_unknown_sar_detection_polarization(settings, logger=logger)
 
         # convert settings['min_beach_area'] from metres to pixels
         min_beach_area_pixels = np.ceil(settings["min_beach_area"] / pixel_size**2)
@@ -1019,26 +1457,83 @@ def extract_shorelines(
                 cloud_mask.shape, georef, image_epsg, pixel_size, settings
             )
 
+            # for SAR the figure shows a single band, not the multi-channel im_ms
+            im_display = im_ms
+            # which class each value of im_labels is, for the figure legend
+            class_labels = ("water", "land")
+            segmentation_method = SDS_tools.SEGMENTATION_MNDWI
+            # fraction of water in the reference shoreline buffer; only computed for
+            # SAR scenes, where it is the QC quantity (see SDS_transects.sar_qc_keep)
+            water_fraction = np.nan
+
             if satname == "S1":
-                # apply the median filter before applying the otsu threshold
-                # im_ms[:, :, 0] = SDS_tools.median_filter(im_ms[:, :, 0], 3)
+                # mean of VV and VH for a dual-polarization scene, the single band
+                # otherwise (see get_sar_otsu_image). Used as the grayscale backdrop of
+                # the detection figure whichever method segmented the scene, so the two
+                # are directly comparable. The SAR imagery is deliberately not smoothed
+                # or speckle-filtered.
+                im_display = get_sar_otsu_image(im_ms, fn, settings)
 
-                im_ms[:, :, 0] = scipy.ndimage.median_filter(im_ms[:, :, 0], size=15)
+                segmentation = segment_sar_water(
+                    im_ms,
+                    fn,
+                    sar_segmenter,
+                    settings,
+                    logger=logger,
+                    date_str=shoreline_date,
+                )
 
-                # instead of applying the classifier here, we will apply the otsu threshold
-                otsu_image, threshold = otsu_threshold(
-                    im_ms[:, :, 0], settings["min_beach_area"]
-                )
-                shoreline = find_shoreline_SAR(
-                    otsu_image, im_ref_buffer, georef, image_epsg, settings
-                )
-                im_labels = otsu_image
-                # convert from list to number if list
-                t_mndwi = (
-                    threshold[0]
-                    if isinstance(threshold, (list, np.ndarray))
-                    else threshold
-                )
+                if segmentation is not None:
+                    im_water, valid, im_prob = segmentation
+                    logger.info(
+                        f"{satname} {shoreline_date}: segmented "
+                        f"{np.sum(im_water) / im_water.size:.2%} water"
+                    )
+                    im_labels = im_water
+                    class_labels = ("land", "water")
+                    segmentation_method = SDS_tools.SEGMENTATION_SAR_MODEL
+                    water_fraction = compute_sar_water_fraction(
+                        im_water, im_ref_buffer & valid
+                    )
+                    if settings.get("sar_save_probability", False):
+                        save_sar_probability(
+                            im_prob, valid, fn, logger=logger, date_str=shoreline_date
+                        )
+                    # invalid pixels must not generate contours of their own
+                    shoreline = find_shoreline_SAR(
+                        im_water, im_ref_buffer & valid, georef, image_epsg, settings
+                    )
+                    # there is no dB threshold to report for a segmentation model, and
+                    # storing the probability cutoff here would be read as one
+                    t_mndwi = np.nan
+                else:
+                    segmentation_method = SDS_tools.SEGMENTATION_SAR_OTSU
+                    logger.info(
+                        f"{satname} {shoreline_date}: thresholding "
+                        f"{describe_sar_otsu_image(fn, settings)}"
+                    )
+
+                    # instead of applying the classifier here, we will apply the otsu
+                    # threshold. min_beach_area_pixels, not settings['min_beach_area']:
+                    # the latter is in m^2, which at 10 m/pixel would drop objects 100x
+                    # larger than asked for (the optical path converts the same way)
+                    otsu_image, threshold = otsu_threshold(
+                        im_display, min_beach_area_pixels
+                    )
+                    shoreline = find_shoreline_SAR(
+                        otsu_image, im_ref_buffer, georef, image_epsg, settings
+                    )
+                    im_labels = otsu_image
+                    # Otsu marks the high-backscatter class - land - as True
+                    water_fraction = compute_sar_water_fraction(
+                        ~otsu_image, im_ref_buffer
+                    )
+                    # convert from list to number if list
+                    t_mndwi = (
+                        threshold[0]
+                        if isinstance(threshold, (list, np.ndarray))
+                        else threshold
+                    )
 
             else:
                 # classify image in 4 classes (sand, whitewater, water, other) with NN classifier
@@ -1135,7 +1630,7 @@ def extract_shorelines(
                 from coastsat.SDS_plotting import plot_detection
 
                 skip_image = plot_detection(
-                    im_ms,
+                    im_display,
                     im_labels,
                     shoreline,
                     image_epsg,
@@ -1148,6 +1643,7 @@ def extract_shorelines(
                     cloud_mask=cloud_mask,
                     shoreline_extraction_area=shoreline_extraction_area_array,
                     is_sar=True if satname == "S1" else False,
+                    class_labels=class_labels,
                 )
 
                 # if the user decides to skip the image, continue and do not save the mapped shoreline
@@ -1162,6 +1658,8 @@ def extract_shorelines(
             output_geoaccuracy.append(metadata[satname]["acc_georef"][i])
             output_idxkeep.append(i)
             output_t_mndwi.append(t_mndwi)
+            output_segmentation.append(segmentation_method)
+            output_water_fraction.append(water_fraction)
 
         # create dictionnary of output
         output[satname] = {
@@ -1172,6 +1670,11 @@ def extract_shorelines(
             "geoaccuracy": output_geoaccuracy,
             "idx": output_idxkeep,
             "MNDWI_threshold": output_t_mndwi,
+            "segmentation_method": output_segmentation,
+            # appended for every satellite (NaN for optical): merge_output builds its
+            # key list from the first satellite only, so a column missing on one
+            # satellite would be dropped for all of them
+            "water_fraction": output_water_fraction,
         }
 
     # close figure window if still open
@@ -1660,10 +2163,12 @@ def create_shoreline_buffer(im_shape, georef, image_epsg, pixel_size, settings):
 
             im_binary[rr[valid], cc[valid]] = True
 
-    # Dilate the binary reference line to create the buffer
-    max_dist_ref_pixels = int(np.ceil(settings["max_dist_ref"] / pixel_size))
-    se = morphology.disk(max_dist_ref_pixels)
-    im_buffer = morphology.binary_dilation(im_binary, se)
+        # Dilate the binary reference line to create the buffer. This only makes
+        # sense when a reference shoreline was given; without one the buffer stays
+        # all True, so the whole image is searched.
+        max_dist_ref_pixels = int(np.ceil(settings["max_dist_ref"] / pixel_size))
+        se = morphology.disk(max_dist_ref_pixels)
+        im_buffer = SDS_tools.binary_dilation(im_binary, se)
 
     return im_buffer
 

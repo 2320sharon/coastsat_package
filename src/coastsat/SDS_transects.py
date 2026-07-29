@@ -234,9 +234,16 @@ def compute_intersection(output, transects, settings):
             # calculate point to line distance between shoreline points and the transect
             p1 = np.array([X0, Y0])
             p2 = transects[key][-1, :]
-            d_line = np.abs(np.cross(p2 - p1, sl - p1) / np.linalg.norm(p2 - p1))
+            # 2-D cross product written out. np.cross on 2-vectors is deprecated in
+            # NumPy 2.0 and slated for removal; for a=(ax,ay) and b=(bx,by) the only
+            # non-zero component is ax*by - ay*bx, which is all this distance needs.
+            v = p2 - p1
+            w = sl - p1
+            d_line = np.abs((v[0] * w[:, 1] - v[1] * w[:, 0]) / np.linalg.norm(v))
             # calculate the distance between shoreline points and the origin of the transect
-            d_origin = np.array([np.linalg.norm(sl[k, :] - p1) for k in range(len(sl))])
+            # vectorized: `w` is already sl - p1, so this is a single row-wise norm
+            # instead of one np.linalg.norm call per shoreline point
+            d_origin = np.linalg.norm(w, axis=1)
             # find the shoreline points that are close to the transects and to the origin
             # the distance to the origin is hard-coded here to 1 km
             idx_dist = np.logical_and(
@@ -357,9 +364,16 @@ def compute_intersection_QC(output, transects, settings, use_progress_bar: bool 
             # calculate point to line distance between shoreline points and the transect
             p1 = np.array([X0, Y0])
             p2 = transects[key][-1, :]
-            d_line = np.abs(np.cross(p2 - p1, sl - p1) / np.linalg.norm(p2 - p1))
+            # 2-D cross product written out. np.cross on 2-vectors is deprecated in
+            # NumPy 2.0 and slated for removal; for a=(ax,ay) and b=(bx,by) the only
+            # non-zero component is ax*by - ay*bx, which is all this distance needs.
+            v = p2 - p1
+            w = sl - p1
+            d_line = np.abs((v[0] * w[:, 1] - v[1] * w[:, 0]) / np.linalg.norm(v))
             # calculate the distance between shoreline points and the origin of the transect
-            d_origin = np.array([np.linalg.norm(sl[k, :] - p1) for k in range(len(sl))])
+            # vectorized: `w` is already sl - p1, so this is a single row-wise norm
+            # instead of one np.linalg.norm call per shoreline point
+            d_origin = np.linalg.norm(w, axis=1)
             # find the shoreline points that are close to the transects and to the origin
             # the distance to the origin is hard-coded here to 1 km
             idx_dist = np.logical_and(d_line <= along_dist, d_origin <= 1000)
@@ -461,6 +475,135 @@ def compute_intersection_QC(output, transects, settings, use_progress_bar: bool 
 ###################################################################################################
 
 
+def threshold_filter_applies(output):
+    """
+    Per shoreline, whether settings['otsu_threshold'] can be compared to its threshold.
+
+    output['MNDWI_threshold'] does not hold the same quantity for every shoreline. Only
+    the optical path stores an MNDWI value there; SAR stores an Otsu threshold in dB, or
+    NaN when the segmentation model mapped the shoreline and there is no threshold at
+    all. Comparing those against an MNDWI range silently drops them - NaN fails every
+    comparison, and a dB value near -20 falls outside any sensible MNDWI range - so the
+    shorelines this returns False for skip the filter instead of being discarded by it.
+
+    Falls back to the satellite name for outputs written before 'segmentation_method'
+    existed, and to True when neither key is present, which keeps the original behaviour
+    for purely optical outputs.
+
+    Arguments:
+    -----------
+    output: dict
+        merged output dict, as returned by SDS_tools.merge_output
+
+    Returns:
+    -----------
+    np.ndarray: boolean, one entry per shoreline
+
+    """
+    thresholds = np.array(output["MNDWI_threshold"], dtype=float)
+    n_shorelines = len(thresholds)
+
+    if "segmentation_method" in output:
+        comparable = np.array(
+            [
+                method == SDS_tools.SEGMENTATION_MNDWI
+                for method in output["segmentation_method"]
+            ]
+        )
+    elif "satname" in output:
+        # older outputs: every SAR shoreline was thresholded in dB
+        comparable = np.array([satname != "S1" for satname in output["satname"]])
+    else:
+        comparable = np.ones(n_shorelines, dtype=bool)
+
+    # a NaN threshold can never satisfy a range, so it must not be filtered on
+    return comparable & np.isfinite(thresholds)
+
+
+# Water fractions closer to all-land or all-water than this mean the segmentation
+# found (almost) no interface inside the reference buffer. Deliberately loose so it
+# only drops degenerate scenes; tighten it per site via
+# settings['sar_water_fraction_range'], or set that to None to disable the check.
+DEFAULT_SAR_WATER_FRACTION_RANGE = (0.01, 0.99)
+
+
+def sar_qc_keep(output, settings):
+    """
+    Per shoreline, whether it passes the SAR-specific QC. Non-SAR rows always pass.
+
+    SAR shorelines skip the MNDWI threshold filter (see threshold_filter_applies), so
+    they get their own checks here:
+
+    - Water fraction: output['water_fraction'] holds the fraction of the reference
+      shoreline buffer segmented as water. A value outside
+      settings['sar_water_fraction_range'] (default DEFAULT_SAR_WATER_FRACTION_RANGE)
+      means the scene segmented as (almost) all land or all water - there was no
+      interface to contour, so the mapped shoreline is dropped. Rows without the
+      column (outputs written before it existed) and NaN fractions are kept.
+    - Otsu dB threshold: when settings['sar_otsu_threshold'] is set to
+      (min_dB, max_dB), 'sar_otsu' rows whose threshold falls outside it are dropped,
+      the SAR counterpart of settings['otsu_threshold']. Off by default, because a
+      sensible dB range is site- and sea-state-dependent.
+
+    Model-segmented rows have no threshold at all, so the water fraction is the only
+    check that can judge them.
+
+    Arguments:
+    -----------
+    output: dict
+        merged output dict, as returned by SDS_tools.merge_output
+    settings: dict
+        may contain 'sar_water_fraction_range' and 'sar_otsu_threshold'
+
+    Returns:
+    -----------
+    np.ndarray: boolean, one entry per shoreline, False where the row fails QC
+
+    """
+    n_shorelines = len(output["dates"])
+    keep = np.ones(n_shorelines, dtype=bool)
+
+    methods = output.get("segmentation_method")
+    if methods is not None:
+        is_sar = np.array(
+            [
+                method
+                in (SDS_tools.SEGMENTATION_SAR_OTSU, SDS_tools.SEGMENTATION_SAR_MODEL)
+                for method in methods
+            ]
+        )
+        is_otsu = np.array(
+            [method == SDS_tools.SEGMENTATION_SAR_OTSU for method in methods]
+        )
+    elif "satname" in output:
+        # older outputs: every SAR shoreline was thresholded in dB
+        is_sar = np.array([satname == "S1" for satname in output["satname"]])
+        is_otsu = is_sar
+    else:
+        return keep
+
+    fraction_range = settings.get(
+        "sar_water_fraction_range", DEFAULT_SAR_WATER_FRACTION_RANGE
+    )
+    if fraction_range is not None and "water_fraction" in output:
+        fractions = np.array(output["water_fraction"], dtype=float)
+        judged = is_sar & np.isfinite(fractions)
+        keep[
+            judged
+            & ((fractions < fraction_range[0]) | (fractions > fraction_range[1]))
+        ] = False
+
+    db_range = settings.get("sar_otsu_threshold")
+    if db_range is not None and not np.isnan(db_range[0]):
+        thresholds = np.array(output["MNDWI_threshold"], dtype=float)
+        judged = is_otsu & np.isfinite(thresholds)
+        keep[
+            judged & ((thresholds < db_range[0]) | (thresholds > db_range[1]))
+        ] = False
+
+    return keep
+
+
 def reject_outliers(cross_distance, output, settings):
     """
 
@@ -474,7 +617,17 @@ def reject_outliers(cross_distance, output, settings):
                 'max_cross_change': int (in metres)
                     maximum cross-shore change observable between consecutive timesteps
                 'otsu_threshold': tuple (min_t, max_t)
-                    min and max intensity threshold use for contouring the shoreline
+                    min and max intensity threshold use for contouring the shoreline.
+                    Only applied to shorelines whose threshold is an MNDWI value; SAR
+                    shorelines skip it rather than being dropped by it, see
+                    threshold_filter_applies.
+                'sar_water_fraction_range': tuple, optional
+                    (min, max) acceptable water fraction in the reference buffer for
+                    SAR shorelines, default DEFAULT_SAR_WATER_FRACTION_RANGE; None
+                    disables the check (see sar_qc_keep)
+                'sar_otsu_threshold': tuple, optional
+                    (min_dB, max_dB) range for 'sar_otsu' shorelines, the SAR
+                    counterpart of 'otsu_threshold'; off when not set
 
     Returns:
     -----------
@@ -484,6 +637,12 @@ def reject_outliers(cross_distance, output, settings):
     """
 
     chain_dict = dict([])
+
+    # which shorelines the otsu_threshold range can actually judge
+    applies = threshold_filter_applies(output)
+    # SAR shorelines skip that range, so they get their own QC (water fraction,
+    # optional dB threshold range); True for every non-SAR shoreline
+    sar_keep = sar_qc_keep(output, settings)
 
     for i, key in enumerate(list(cross_distance.keys())):
         chainage = cross_distance[key].copy()
@@ -496,22 +655,27 @@ def reject_outliers(cross_distance, output, settings):
         dates1 = [output["dates"][k] for k in idx_nonan]
         #        satnames1 = [output['satname'][k] for k in idx_nonan]
 
-        # 2. Remove points where the MNDWI threshold is above a certain value (max_threshold)
-        if np.isnan(settings["otsu_threshold"][0]):
-            chainage2 = chainage1
-            dates2 = dates1
-        else:
-            threshold1 = [output["MNDWI_threshold"][k] for k in idx_nonan]
-            idx_thres = np.where(
-                np.logical_and(
-                    np.array(threshold1) <= settings["otsu_threshold"][1],
-                    np.array(threshold1) >= settings["otsu_threshold"][0],
-                )
-            )[0]
-            chainage2 = [chainage1[k] for k in idx_thres]
-            dates2 = [dates1[k] for k in idx_thres]
-            if len(chainage2) < 30:
-                continue
+        # 2. Threshold-based QC: the MNDWI range for optical shorelines, the
+        #    SAR-specific checks for SAR ones
+        keep = sar_keep[idx_nonan].copy()
+        if not np.isnan(settings["otsu_threshold"][0]):
+            threshold1 = np.array(
+                [output["MNDWI_threshold"][k] for k in idx_nonan], dtype=float
+            )
+            # shorelines whose threshold is not an MNDWI value are kept as they are:
+            # the range cannot judge them, and comparing anyway would drop every one
+            filterable = applies[idx_nonan]
+            keep &= ~filterable | (
+                (threshold1 <= settings["otsu_threshold"][1])
+                & (threshold1 >= settings["otsu_threshold"][0])
+            )
+        idx_thres = np.where(keep)[0]
+        chainage2 = [chainage1[k] for k in idx_thres]
+        dates2 = [dates1[k] for k in idx_thres]
+        # the minimum-points guard is tied to the MNDWI range filter, as it always
+        # was; the SAR QC must not start dropping whole transects of short series
+        if not np.isnan(settings["otsu_threshold"][0]) and len(chainage2) < 30:
+            continue
 
         # 3. Remove outliers based on despiking [iterative method]
         chainage3, dates3 = identify_outliers(
