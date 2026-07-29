@@ -8,9 +8,7 @@
 #
 # No credentials are needed. Nothing in tests/ calls ee.Initialize or ee.Authenticate:
 # ee.Filter is monkeypatched where it is exercised and download_S1_image is stubbed. Tests
-# that would need real assets self-skip -- test_sar_model_integration.py on the absent 130 MB
-# .onnx, test_cloud_coverage.py on an absent data/ folder -- and `-ra` in the pytest addopts
-# makes those skips visible in the log rather than silent.
+# that would need real assets self-skip like the test_sar_model_integration.py on the SAR model are skipped
 name: Tests
 
 on:
@@ -51,8 +49,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        # Floor matches requires-python in pyproject.toml. 3.9 is deliberately absent:
-        # scikit-image 0.25, which the numpy>=2 floor depends on, dropped it.
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     defaults:
       run:
@@ -68,7 +64,7 @@ jobs:
       # backend on macOS (MacOSX) and Windows (QtAgg, since the conda `matplotlib`
       # metapackage pulls pyqt) and hangs or errors on a headless runner.
       MPLBACKEND: Agg
-      # Only meaningful on Linux, and inert elsewhere because MPLBACKEND=Agg means Qt is
+      # QT_QPA_PLATFORM : Linux-only, inert elsewhere because MPLBACKEND=Agg means Qt is
       # never loaded at all. Kept for parity with the pixi `test-suite` task.
       QT_QPA_PLATFORM: offscreen
       # Windows runners default to cp1252 and several tests round-trip text through tmp_path.
@@ -272,3 +268,49 @@ jobs:
           retention-days: 7
           # Wheels and sdists are already compressed; re-zipping only costs time.
           compression-level: 0
+
+  # Publishing lives in THIS workflow rather than a separate one triggered by the same tag.
+  # A standalone workflow races the two jobs above and uploads whether or not they passed --
+  # and a PyPI version number can never be reused once it is taken, so there is no undo.
+  # `needs` supplies the ordering; downloading the artifact rather than rebuilding means the
+  # bytes that were tested are the bytes that ship, with no second resolve of the build
+  # backend that could differ.
+  publish:
+    name: Publish to PyPI
+    needs: [test, release-gate]
+    # Version tags only. Pushes to master and pull requests run everything above and stop here.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # 3.11 for stdlib tomllib, used by the version check below.
+          python-version: "3.11"
+
+      # [project].version is hardcoded; nothing derives it from the tag. Tagging v0.5.1
+      # without bumping it rebuilds 0.5.0, and PyPI rejects the upload as a duplicate -- after
+      # the full twelve-leg matrix and the release gate have already run. Fail in seconds
+      # instead, before anything is published.
+      - name: Tag must match [project].version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])")
+          echo "git tag:   $tag"
+          echo "pyproject: $ver"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag v$tag does not match [project].version $ver in pyproject.toml"
+            exit 1
+          fi
+
+      - name: Fetch the artifacts the release gate built and verified
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ github.sha }}
+          path: dist/
+
+      - name: Show what is about to be published
+        run: ls -l dist/
