@@ -1,44 +1,262 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
-
-# tells setup tools to include the data in the coastsat directory
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-"*"=["*.kml","*.pkl"]
 
 [project]
 name = "coastsat_package"
-dynamic = ["readme"]
-version = "0.4.8"
+version = "0.5.0"
+description = "A packaged version of CoastSat: a global shoreline mapping tool using satellite imagery"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-only"
+license-files = ["LICENSE.md"]
 authors = [
-  { name="Sharon Batiste" },
+  { name = "Sharon Batiste" },
 ]
-# find` directive with `include` or `exclude`
-description = "A packaged version of CoastSat: A Global shoreline mapping tool from satellite imagery"
-dependencies = [ "scikit-image",
-  "earthengine-api>=0.1.304",
-  "jupyterlab>=3.0.0",
-  "geopandas",
-  "matplotlib",
-  "astropy",
-  "tqdm",
-  "importlib-resources",
-  "pyqt5",
-  "scipy",
-  "numpy",
-  "imageio",
-  "scikit-learn"]
-license = { file="LICENSE" }
-requires-python = ">=3.8"
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
+  # No "License ::" classifier here: setuptools>=77 rejects it alongside the
+  # PEP 639 `license = "GPL-3.0-only"` expression above.
+  # Kept in step with requires-python above and the matrix in
+  # .github/workflows/tests.yml -- these three are the only places the supported
+  # interpreter set is written down, and nothing cross-checks them.
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+  # GDAL is intentionally NOT declared here even though SDS_tools.py and
+  # SDS_preprocess.py do `from osgeo import gdal`: GDAL publishes no wheels on
+  # PyPI, so declaring it makes plain `pip install` attempt a source build that
+  # fails on most machines (and breaks `pip install coastseg`, which pulls this
+  # package before conda can provide gdal). Install it from conda-forge instead
+  # -- see gdal in [tool.pixi.dependencies] below.
+  "astropy",
+  "earthengine-api>=0.1.304",
+  "geopandas",
+  "google-auth",
+  "imageio",
+  "importlib-resources",
+  "joblib",
+  "matplotlib",
+  # Floored to match [tool.pixi.dependencies]. A pip-only install that resolved numpy 1.x
+  # would fail to unpickle the reference-shoreline .pkl files, which reference `numpy._core`
+  # -- see the long comment on numpy below. The scikit-image floor is what makes this
+  # reachable; the two move together.
+  "numpy>=2",
+  "onnxruntime",
+  "pandas",
+  "Pillow",
+  "pooch",
+  "PyQt5",
+  "pytz",
+  "requests",
+  # Left open, the resolver settles on scikit-image 0.20, which caps numpy at <2.0a0 and
+  # silently undoes the numpy floor above. Mirroring this became possible once
+  # requires-python moved to >=3.10 -- scikit-image 0.25 dropped 3.9.
+  "scikit-image>=0.25",
+  "scikit-learn",
+  "scipy",
+  "shapely",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+notebook = [
+  "ipykernel",
+  "jupyterlab>=3",
+]
+test = [
+  "pytest>=8",
+  "pytest-cov>=5",
+]
+# Repeats the two entries from `test` on purpose: a self-referencing
+# "coastsat_package[test]" extra resolves inconsistently across pip/uv versions.
+dev = [
+  "build>=1.2",
+  "pytest>=8",
+  "pytest-cov>=5",
+  "ruff>=0.9",
+  "twine>=5",
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/SatelliteShorelines/coastsat_package"
+Homepage = "https://github.com/SatelliteShorelines/coastsat_package"
+Repository = "https://github.com/SatelliteShorelines/coastsat_package"
 "Bug Tracker" = "https://github.com/SatelliteShorelines/coastsat_package/issues"
+
+[tool.pytest.ini_options]
+# Confines collection to tests/ -- the root-level example_*.py scripts reach out to Earth
+# Engine and must never be collected, and this keeps any future stray root-level test file
+# out too. Also makes `pytest` behave the same no matter which directory it is run from.
+testpaths = ["tests"]
+# tests_archive_* holds dated snapshots of tests/. Both it and tests/ carry an __init__.py,
+# so pytest derives distinct dotted module names and there is no import collision -- the
+# cost is silently running the suite twice against a frozen copy of the code. testpaths
+# already keeps a bare `pytest` out; this also blocks an explicit `pytest <path>` from
+# walking in, and keeps collection off the gitignored data/ and build trees.
+norecursedirs = ["tests_archive_*", "data", "dist", "build", ".pixi", "*.egg-info"]
+# --strict-markers turns a typo'd or unregistered marker into an error instead of letting
+# the marked test run unconditionally; every custom marker must appear in `markers` below.
+# --strict-config does the same for typos in this table. -ra summarises skips and xfails,
+# which matters here because several tests self-skip on absent optional assets (the 130 MB
+# SAR .onnx, a populated data/ folder) and that should be visible rather than silent.
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+markers = [
+  "perf: long-running performance benchmark; deselect with -m 'not perf'",
+]
+# An xfail that starts passing is a signal the underlying bug was fixed, not a pass.
+xfail_strict = true
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["coastsat*"]
+
+[tool.setuptools.package-data]
+# The Sentinel-1 segmentation model (SAR_3_band_model.onnx, ~130 MB) is NOT
+# shipped -- it exceeds PyPI's file-size limit and is downloaded on demand by
+# SDS_sar_model.fetch_default_sar_model().
+coastsat = [
+  "*.kml",
+  "*.pkl",
+  "**/*.kml",
+  "**/*.pkl",
+]
+
+# The two CoastSat_training_set_*.pkl files are 32.2 MB of a 32.9 MB wheel and
+# nothing at runtime reads them -- SDS_shoreline imports the `training_data`
+# package but never uses the name, and the classifiers actually loaded are
+# classification/models/NN_4classes_*.pkl. Only train_new_classifier.ipynb wants
+# them, and it resolves paths from os.getcwd(), so it needs a checkout anyway.
+# They stay in git; MANIFEST.in keeps them out of the sdist and this table keeps
+# them out of the wheel.
+#
+# BOTH keys are required -- setuptools offers these files to the wheel twice and
+# an exclusion only applies to the package currently being processed:
+#   1. as data of `coastsat`, pulled in by the "**/*.pkl" glob above, which
+#      recurses into subdirectories;
+#   2. as data of `coastsat.classification.training_data`, which packages.find
+#      discovers as a package in its own right.
+# Dropping either key silently ships the files again. The dotted key MUST be
+# quoted or TOML reads the dots as nested tables -- also silent.
+# Patterns are relative to each key's own package directory, which is why the
+# two entries look different.
+[tool.setuptools.exclude-package-data]
+coastsat = ["classification/training_data/*.pkl"]
+"coastsat.classification.training_data" = ["*.pkl"]
+
+# Pixi reads standard [project] dependencies as PyPI requirements. The
+# matching entries below make Pixi install the scientific/GIS stack from
+# conda-forge instead, avoiding fragile source builds for GDAL, Qt, and friends.
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+channel-priority = "strict"
+platforms = ["linux-64", "win-64", "osx-64", "osx-arm64"]
+
+# Tells Pixi which conda package satisfies which PyPI requirement, so the
+# [project] dependencies above are resolved from conda-forge rather than being
+# re-downloaded as wheels. The value must be a path (or URL) to a JSON file --
+# an inline table here is a parse error. Note the file REPLACES the default
+# conda-forge mapping rather than merging with it, so every direct dependency
+# has to be listed, not just the ones whose names differ.
+[tool.pixi.workspace.conda-pypi-map]
+conda-forge = "conda-pypi-map.json"
+
+[tool.pixi.dependencies]
+python = "3.11.*"
+astropy = "*"
+earthengine-api = ">=0.1.304"
+gdal = "*"
+geopandas = "*"
+google-auth = "*"
+imageio = "*"
+importlib_resources = "*"
+# SDS_shoreline loads the .pkl classifiers with joblib.load; it only reaches the
+# environment today as a scikit-learn transitive dep, so declare it directly.
+joblib = "*"
+matplotlib = "*"
+# numpy 2 on purpose. Pickles written under numpy 2 reference `numpy._core`, which
+# numpy 1.x cannot import at all -- the reference-shoreline .pkl files sitting in
+# existing data/ folders are written that way and raise ModuleNotFoundError under
+# 1.26. numpy 2 reads both eras: it ships a `numpy.core` compat shim for numpy-1
+# pickles, which is what the packaged NN_4classes_*.pkl classifiers still are.
+# This was only unblockable once scikit-image was floored below (0.20 capped
+# numpy at <2.0a0), so keep that floor if you touch this.
+numpy = ">=2"
+# Pin the CPU build. conda-forge gives its GPU variants build number 200 against 0 for
+# CPU, so an unpinned "onnxruntime" resolves to the CUDA build on any machine with an
+# NVIDIA driver (the __cuda virtual package) and drags in ~2.9 GB of cudatoolkit/cudnn.
+# SDS_sar_model opens the session with CPUExecutionProvider only, so none of it is used.
+onnxruntime = { version = "*", build = "*cpu*" }
+pandas = "*"
+pillow = "*"
+pooch = "*"
+pyqt = "5.15.*"
+pytz = "*"
+requests = "*"
+# Floor, not a pin. Left open, the solver settles on scikit-image 0.20.0 (2023),
+# which caps numpy at <2.0a0 and drags tifffile down to 2020.6.3. 0.25+ declares
+# numpy >=1.23,<3, so this floor is what keeps the numpy version free to move.
+# Now mirrored into [project] dependencies above as well: that was blocked while
+# requires-python allowed 3.9, which scikit-image 0.25 dropped. Keep the two in step.
+scikit-image = ">=0.25"
+scikit-learn = "*"
+scipy = "*"
+shapely = "*"
+tqdm = "*"
+
+# Install this repository itself in editable mode.
+[tool.pixi.pypi-dependencies]
+coastsat-package = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+auth = "earthengine authenticate"
+smoke = "python -c \"import coastsat, ee, geopandas, numpy, pandas, PyQt5; from osgeo import gdal; print('CoastSat environment OK')\""
+# Defined here in the default feature, so every environment has them and a bare
+# `pixi run test` is never ambiguous; each re-invokes pixi to run pytest in the `test`
+# environment. Trailing arguments are appended by pixi at both hops, so
+# `pixi run test tests/test_sar_model.py -k fetch` reaches pytest intact.
+# MPLBACKEND keeps matplotlib headless -- it is inherited by the inner invocation.
+test = { cmd = "pixi run -e test pytest -q", env = { MPLBACKEND = "Agg" } }
+test-cov = { cmd = "pixi run -e test pytest --cov=coastsat --cov-report=term-missing", env = { MPLBACKEND = "Agg" } }
+
+[tool.pixi.feature.notebook.dependencies]
+ipykernel = "*"
+jupyterlab = ">=3"
+
+[tool.pixi.feature.notebook.tasks]
+lab = "jupyter lab"
+
+# The optional test add-on: `pixi install -e test` gives the runtime stack plus pytest and
+# nothing else (no jupyterlab, ruff, twine or build). The dev environment picks this feature
+# up as well, so pytest is still available there.
+[tool.pixi.feature.test.dependencies]
+pytest = ">=8"
+pytest-cov = ">=5"
+
+[tool.pixi.feature.dev.dependencies]
+# conda-forge ships the PyPI "build" package under the name "python-build"
+python-build = ">=1.2"
+ruff = ">=0.9"
+twine = ">=5"
+
+[tool.pixi.feature.dev.tasks]
+lint = "ruff check src tests"
+format = "ruff format src tests"
+build-package = "python -m build"
+check-package = "twine check dist/*"
+
+[tool.pixi.environments]
+default = { features = [], solve-group = "coastsat" }
+notebook = { features = ["notebook"], solve-group = "coastsat" }
+test = { features = ["test"], solve-group = "coastsat" }
+# A superset of every other environment. The shared solve-group means the pytest run here
+# and in the `test` environment use identical package versions.
+dev = { features = ["notebook", "test", "dev"], solve-group = "coastsat" }

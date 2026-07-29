@@ -8,3 +8,5 @@ dist/*
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+# the SAR model is downloaded on demand, never committed (it lives on Hugging Face)
+*.onnx

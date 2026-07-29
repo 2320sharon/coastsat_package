@@ -1,10 +1,32 @@
 include MANIFEST.in
-include LICENSE
+include LICENSE.md
 include pyproject.toml
-include *.md
+# Only these two .md files ship. A bare `include *.md` also swept in the dev
+# docs (RELEASE_NOTES, SAR_INTEGRATION_GUIDE, SAR_WORKFLOW_CHANGES,
+# compression_benchmark_report) -- ~85 KB of noise in every download.
+# README.md is required: pyproject.toml sets readme = "README.md".
+include README.md
+
+# [tool.pixi.workspace.conda-pypi-map] in pyproject.toml points at this file by
+# relative path. pip never reads that table, but without this line an unpacked
+# sdist has a pyproject.toml referencing a file that isn't there, so `pixi
+# install` from the sdist fails.
+include conda-pypi-map.json
 
 # Include src directories in package
 graft src
+
+# The 130 MB SAR .onnx model is downloaded on demand (SDS_sar_model), never shipped
+recursive-exclude src *.onnx
+
+# The two CoastSat_training_set_*.pkl files are 32.2 MB and nothing at runtime
+# reads them -- see the [tool.setuptools.exclude-package-data] note in
+# pyproject.toml, which keeps them out of the wheel. This line is the sdist half
+# of the same job: exclude-package-data governs the wheel only, the sdist follows
+# this file. They stay in git, which is all train_new_classifier.ipynb needs
+# (it resolves paths from os.getcwd(), so it requires a checkout regardless).
+# Must come after `graft src` above -- MANIFEST.in directives apply in order.
+recursive-exclude src/coastsat/classification/training_data *.pkl
 
 
 # Remove the pycache directory and any pycache files
