@@ -19,6 +19,15 @@ recursive-exclude src *.onnx
 # Must come after `graft src` above -- MANIFEST.in directives apply in order.
 recursive-exclude src/coastsat/classification/training_data *.pkl
 
+# Same for the training-site regions of interest (git only). Nothing in the library
+# reads them: SDS_shoreline imports the training_sites package but never uses the
+# name, and the .kml readers in SDS_tools take a user-supplied path. Only
+# train_new_classifier.ipynb wants them, from os.getcwd()/training_sites.
+# The matching [tool.setuptools.exclude-package-data] key covers the wheel; this
+# line is the sdist half, since include-package-data = true means the wheel
+# otherwise inherits whatever the sdist carries.
+recursive-exclude src/coastsat/classification/training_sites *.kml
+
 
 # Remove the pycache directory and any pycache files
 prune src/coastsat/__pycache__

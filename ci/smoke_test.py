@@ -84,17 +84,24 @@ def main() -> None:
             sys.exit(f"classifier looks truncated: {path}")
     print(f"all {len(CLASSIFIER_STEMS)} classifiers present")
 
-    # The .kml training sites are loaded through importlib.resources, so resolve them the
-    # same way rather than by joining paths.
+    # training_sites and training_data ship as importable packages with no payload -- their
+    # .kml and .pkl contents are git-only. SDS_shoreline imports both names at module scope,
+    # so what matters is that the packages resolve, which the import loop above proved.
     import importlib.resources as resources
 
     from coastsat.classification import training_sites
 
     sites_dir = os.path.abspath(resources.files(training_sites))
-    for kml in ("BYRON.kml", "NEWCASTLE.kml", "SAWTELL.kml"):
-        if not os.path.isfile(os.path.join(sites_dir, kml)):
-            sys.exit(f"training site missing: {os.path.join(sites_dir, kml)}")
-    print(f"training sites present in {sites_dir}")
+
+    # Only meaningful against a real installation. Under the editable install used for local
+    # runs this resolves into the checkout, where the .kml files are present and correct.
+    if args.require_installed:
+        stowaways = sorted(f for f in os.listdir(sites_dir) if f.endswith(".kml"))
+        if stowaways:
+            sys.exit(f"training-site .kml files are git-only but shipped: {stowaways}")
+        print(f"training_sites importable and payload-free: {sites_dir}")
+    else:
+        print(f"training_sites importable: {sites_dir}")
 
     print("\nsmoke test OK")
 

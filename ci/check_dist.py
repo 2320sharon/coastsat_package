@@ -54,16 +54,14 @@ CLASSIFIER_STEMS = [
 ]
 
 # SDS_shoreline does `from coastsat.classification import models, training_data,
-# training_sites`, so all three need an __init__.py in the wheel even though training_data's
-# payload is deliberately excluded below.
+# training_sites`, so all three need an __init__.py in the wheel -- the packages must import
+# even though the payloads of training_data and training_sites are deliberately excluded
+# below. The classifiers under models/ are the only data the library actually loads.
 REQUIRED_DATA = [
     "coastsat/classification/__init__.py",
     "coastsat/classification/models/__init__.py",
     "coastsat/classification/training_data/__init__.py",
     "coastsat/classification/training_sites/__init__.py",
-    "coastsat/classification/training_sites/BYRON.kml",
-    "coastsat/classification/training_sites/NEWCASTLE.kml",
-    "coastsat/classification/training_sites/SAWTELL.kml",
 ] + [f"coastsat/classification/models/NN_4classes_{stem}.pkl" for stem in CLASSIFIER_STEMS]
 
 FORBIDDEN = [
@@ -79,6 +77,14 @@ FORBIDDEN = [
         "coastsat/classification/training_data/*.pkl",
         "the training sets are git-only and must not ship",
     ),
+    # Same story for the training-site regions of interest. Nothing in the library reads
+    # them -- SDS_shoreline imports the training_sites package but never uses the name, and
+    # the .kml readers in SDS_tools take a user-supplied path. Their only consumer is
+    # train_new_classifier.ipynb, which resolves os.getcwd()/training_sites from a checkout.
+    (
+        "coastsat/classification/training_sites/*.kml",
+        "the training-site .kml files are git-only and must not ship",
+    ),
 ]
 
 # The same rule for the sdist. "git only" means absent from both artifacts, and the sdist
@@ -89,6 +95,10 @@ SDIST_FORBIDDEN = [
     (
         "*/src/coastsat/classification/training_data/*.pkl",
         "the training sets are git-only and must not ship",
+    ),
+    (
+        "*/src/coastsat/classification/training_sites/*.kml",
+        "the training-site .kml files are git-only and must not ship",
     ),
 ]
 

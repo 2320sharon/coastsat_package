@@ -9041,7 +9041,7 @@ packages:
 - pypi: ./
   name: coastsat-package
   version: 0.5.0
-  sha256: f9ed19547e096f26d4fd3e9370070f6c695decebca8bd6275a15a9c89a992b24
+  sha256: 7ab27f4590c1587e5a5171505719ad7b7280900dc6ba8b4f8c70346152eef38d
   requires_dist:
   - astropy
   - earthengine-api>=0.1.304
