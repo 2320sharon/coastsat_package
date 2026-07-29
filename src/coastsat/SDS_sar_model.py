@@ -156,9 +156,7 @@ def get_sar_model_path(settings: Optional[Dict[str, Any]] = None) -> str:
     if os.path.isfile(bundled):
         return bundled
 
-    return os.path.abspath(
-        os.path.join(_model_cache_dir(), DEFAULT_SAR_MODEL_FILENAME)
-    )
+    return os.path.abspath(os.path.join(_model_cache_dir(), DEFAULT_SAR_MODEL_FILENAME))
 
 
 def fetch_default_sar_model() -> str:
@@ -287,7 +285,9 @@ def _validate_spec(spec: Dict[str, Any]) -> None:
 
     speckle_filter = spec.get("speckle_filter") or {}
     filter_type = (
-        speckle_filter.get("type") if isinstance(speckle_filter, dict) else speckle_filter
+        speckle_filter.get("type")
+        if isinstance(speckle_filter, dict)
+        else speckle_filter
     )
     if str(filter_type).lower() != "none":
         # the Lee-family filters do not export into the graph, so they would have to be
@@ -352,14 +352,10 @@ def load_sar_model(model_path: Optional[str] = None) -> Tuple[Any, Dict[str, Any
             model_path = fetch_default_sar_model()
         else:
             # explicit sar_model_path overrides are never downloaded
-            raise SarModelUnavailable(
-                f"SAR segmentation model not found: {model_path}"
-            )
+            raise SarModelUnavailable(f"SAR segmentation model not found: {model_path}")
 
     try:
-        session = ort.InferenceSession(
-            model_path, providers=["CPUExecutionProvider"]
-        )
+        session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     except Exception as exc:
         raise SarModelUnavailable(
             f"could not open the SAR segmentation model '{model_path}': {exc}"
@@ -483,7 +479,9 @@ def _water_prob_from_outputs(session, outputs) -> np.ndarray:
         # softmax over the class axis, then keep the water channel
         shifted = logits - logits.max(axis=1, keepdims=True)
         exponentials = np.exp(shifted)
-        return (exponentials / exponentials.sum(axis=1, keepdims=True))[:, WATER : WATER + 1]
+        return (exponentials / exponentials.sum(axis=1, keepdims=True))[
+            :, WATER : WATER + 1
+        ]
 
     raise SarModelUnavailable(
         f"model has outputs {names}, none of which is "

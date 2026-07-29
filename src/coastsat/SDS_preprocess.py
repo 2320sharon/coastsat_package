@@ -279,7 +279,7 @@ def remove_files_above_threshold(
     """
     if prc > threshold:
         print(
-            f"skipping image '{os.path.basename(filepaths[0])}' {msg} {prc*100:.2f}% exceeds threshold of {threshold*100:.2f}%"
+            f"skipping image '{os.path.basename(filepaths[0])}' {msg} {prc * 100:.2f}% exceeds threshold of {threshold * 100:.2f}%"
         )
         # delete files that exceed the cloud cover threshold
         for file in filepaths:
@@ -880,7 +880,9 @@ def preprocess_single(
             # add zeros to im nodata
             im_nodata = np.logical_or(im_zeros, im_nodata)
             if "merged" in fn_ms:
-                im_nodata = morphology.dilation(im_nodata, SDS_tools.footprint_square(5))
+                im_nodata = morphology.dilation(
+                    im_nodata, SDS_tools.footprint_square(5)
+                )
             # update cloud mask with all the nodata pixels
             # v0.1.40 change : might be bug
             cloud_mask = np.logical_or(cloud_mask, im_nodata)
@@ -906,7 +908,9 @@ def preprocess_single(
             # update cloud mask with all the nodata pixels
             cloud_mask = np.logical_or(cloud_mask, im_nodata)
             if "merged" in fn_ms:
-                im_nodata = morphology.dilation(im_nodata, SDS_tools.footprint_square(5))
+                im_nodata = morphology.dilation(
+                    im_nodata, SDS_tools.footprint_square(5)
+                )
             # move cloud mask to above if statement to avoid bug in v0.1.40
 
         # no extra image
@@ -1252,10 +1256,10 @@ def build_sar_preview(im_ms, date, satname):
         im_display = np.dstack(
             [_stretch_sar_band(im_ms[:, :, k]) for k in range(len(bands))]
         )
-        channels = ", ".join(
-            f"{channel}={band}" for channel, band in zip("RGB", bands)
+        channels = ", ".join(f"{channel}={band}" for channel, band in zip("RGB", bands))
+        title = (
+            f"{date} {satname} - composite of the {'/'.join(bands)} bands ({channels})"
         )
-        title = f"{date} {satname} - composite of the {'/'.join(bands)} bands ({channels})"
     else:
         band = im_ms if im_ms.ndim == 2 else im_ms[:, :, 0]
         im_display = _stretch_sar_band(band)

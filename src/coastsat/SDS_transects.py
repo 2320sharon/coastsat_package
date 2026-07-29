@@ -1,7 +1,7 @@
 """
 This module contains functions to analyze the 2D shorelines along shore-normal
 transects
-    
+
 Author: Kilian Vos, Water Research Laboratory, University of New South Wales
 """
 
@@ -26,7 +26,7 @@ from tqdm.auto import tqdm
 
 # Global variables
 DAYS_IN_YEAR = 365.2425
-SECONDS_IN_DAY = 24*3600
+SECONDS_IN_DAY = 24 * 3600
 
 ###################################################################################################
 # DRAW/LOAD TRANSECTS
@@ -401,7 +401,9 @@ def compute_intersection_QC(output, transects, settings, use_progress_bar: bool 
                     med_intersect[i] = np.nanmedian(xy_rot[0, :])
                     max_intersect[i] = np.nanmax(xy_rot[0, :])
                     min_intersect[i] = np.nanmin(xy_rot[0, :])
-                    n_intersect[i] = np.sum(~np.isnan(xy_rot[0, :])) # count only non-nan values
+                    n_intersect[i] = np.sum(
+                        ~np.isnan(xy_rot[0, :])
+                    )  # count only non-nan values
                 else:
                     std_intersect[i] = np.nan
                     med_intersect[i] = np.nan
@@ -424,13 +426,15 @@ def compute_intersection_QC(output, transects, settings, use_progress_bar: bool 
             # compute the percentage of data points where the std is larger than the user-defined max
             prc_over = np.sum(std_intersect > settings["max_std"]) / len(std_intersect)
             # if more than a certain percentage is above, use the maximum intersection
-            
+
             prc_multiple = settings.get("prc_multiple")
             if prc_multiple is None:
                 prc_multiple = settings.get("auto_prc")
                 if prc_multiple is None:
-                    raise KeyError("Neither 'prc_multiple' nor 'auto_prc' exist in the settings.")
-            
+                    raise KeyError(
+                        "Neither 'prc_multiple' nor 'auto_prc' exist in the settings."
+                    )
+
             if prc_over > prc_multiple:
                 med_intersect[~idx_good] = max_intersect[~idx_good]
                 med_intersect[~condition3] = np.nan
@@ -589,17 +593,14 @@ def sar_qc_keep(output, settings):
         fractions = np.array(output["water_fraction"], dtype=float)
         judged = is_sar & np.isfinite(fractions)
         keep[
-            judged
-            & ((fractions < fraction_range[0]) | (fractions > fraction_range[1]))
+            judged & ((fractions < fraction_range[0]) | (fractions > fraction_range[1]))
         ] = False
 
     db_range = settings.get("sar_otsu_threshold")
     if db_range is not None and not np.isnan(db_range[0]):
         thresholds = np.array(output["MNDWI_threshold"], dtype=float)
         judged = is_otsu & np.isfinite(thresholds)
-        keep[
-            judged & ((thresholds < db_range[0]) | (thresholds > db_range[1]))
-        ] = False
+        keep[judged & ((thresholds < db_range[0]) | (thresholds > db_range[1]))] = False
 
     return keep
 
@@ -887,16 +888,14 @@ def seasonal_average(dates, chainages):
             if j == 1:
                 chain_seas = np.array(
                     df[
-                        str(year - 1)
-                        + months[(j - 1) - 1] : str(year)
+                        str(year - 1) + months[(j - 1) - 1] : str(year)
                         + months[(j - 1) + 1]
                     ]["chainage"]
                 )
             else:
                 chain_seas = np.array(
                     df[
-                        str(year)
-                        + months[(j - 1) - 1] : str(year)
+                        str(year) + months[(j - 1) - 1] : str(year)
                         + months[(j - 1) + 1]
                     ]["chainage"]
                 )
@@ -978,10 +977,11 @@ def monthly_average(dates, chainages):
         np.array(season_ts),
     )
 
-def calculate_trend(dates,chainage):
+
+def calculate_trend(dates, chainage):
     "calculate long-term trend"
     dates_ord = np.array([_.toordinal() for _ in dates])
-    dates_ord = (dates_ord - np.min(dates_ord))/DAYS_IN_YEAR   
+    dates_ord = (dates_ord - np.min(dates_ord)) / DAYS_IN_YEAR
     trend, intercept, rvalue, pvalue, std_err = stats.linregress(dates_ord, chainage)
-    y = dates_ord*trend+intercept
+    y = dates_ord * trend + intercept
     return trend, y

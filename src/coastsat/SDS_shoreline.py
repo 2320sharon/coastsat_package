@@ -1343,14 +1343,10 @@ def extract_shorelines(
         # initialise the output variables
         output_timestamp = []  # datetime at which the image was acquired (UTC time)
         output_shoreline = []  # vector of shoreline points
-        output_filename = (
-            []
-        )  # filename of the images from which the shorelines where derived
+        output_filename = []  # filename of the images from which the shorelines where derived
         output_cloudcover = []  # cloud cover of the images
         output_geoaccuracy = []  # georeferencing accuracy of the images
-        output_idxkeep = (
-            []
-        )  # index that were kept during the analysis (cloudy images are skipped)
+        output_idxkeep = []  # index that were kept during the analysis (cloudy images are skipped)
         output_t_mndwi = []  # MNDWI threshold used to map the shoreline
         output_segmentation = []  # how each shoreline was derived, and so what
         # output_t_mndwi holds for it (see SDS_tools.SEGMENTATION_*)
@@ -1551,7 +1547,7 @@ def extract_shorelines(
                 logger.info(
                     f"{satname} {shoreline_date}: "
                     + f" ,".join(
-                        f"{class_name}: {np.sum(im_labels[:, :, index])/im_labels[:, :, index].size:.2%}"
+                        f"{class_name}: {np.sum(im_labels[:, :, index]) / im_labels[:, :, index].size:.2%}"
                         for index, class_name in class_mapping.items()
                     )
                 )

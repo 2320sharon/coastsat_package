@@ -1,5 +1,5 @@
 """
-This module contains functions to label satellite images, use the labels to 
+This module contains functions to label satellite images, use the labels to
 train a pixel-wise classifier and evaluate the classifier
 
 Author: Kilian Vos, Water Research Laboratory, University of New South Wales
@@ -110,7 +110,7 @@ def label_images(metadata, settings):
     """
 
     filepath_train = settings["filepath_train"]
-    collection = 'C02'
+    collection = "C02"
 
     # initialize figure
     fig, ax = plt.subplots(
@@ -311,9 +311,9 @@ def label_images(metadata, settings):
                         sand_pixels.append(fill_sand)
                         # show the labelled pixels
                         for k in range(im_viz.shape[2]):
-                            im_viz[
-                                im_labels == settings["labels"]["sand"], k
-                            ] = color_sand[k]
+                            im_viz[im_labels == settings["labels"]["sand"], k] = (
+                                color_sand[k]
+                            )
                         implot.set_data(im_viz)
                         fig.canvas.draw_idle()
 
@@ -560,7 +560,9 @@ def format_training_data(features, classes, labels):
     return X, y
 
 
-def plot_confusion_matrix(y_true, y_pred, classes, normalize=False, cmap=plt.get_cmap("Blues")):
+def plot_confusion_matrix(
+    y_true, y_pred, classes, normalize=False, cmap=plt.get_cmap("Blues")
+):
     """
     Function copied from the scikit-learn examples (https://scikit-learn.org/stable/)
     This function plots a confusion matrix.
@@ -647,7 +649,7 @@ def evaluate_classifier(classifier, metadata, settings):
     Saves .jpg images with the output of the classification in the folder ./detection
 
     """
-    collection = 'C02'
+    collection = "C02"
     # create folder called evaluation
     fp = os.path.join(os.getcwd(), "evaluation")
     if not os.path.exists(fp):

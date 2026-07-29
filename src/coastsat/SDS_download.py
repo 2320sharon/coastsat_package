@@ -638,7 +638,7 @@ def retry(func):
                 return func(*args, **kwargs)
             except Exception as e:
                 print(
-                    f"Attempt {attempt+1}/{max_attempts} failed with error: {type(e).__name__}"
+                    f"Attempt {attempt + 1}/{max_attempts} failed with error: {type(e).__name__}"
                 )
                 if logger:
                     logger.warning(
@@ -646,7 +646,7 @@ def retry(func):
                     )
                 if attempt == max_attempts - 1:
                     print(
-                        f"Max retries {attempt+1}/{max_attempts}  exceeded for {func.__name__} due to {type(e).__name__}"
+                        f"Max retries {attempt + 1}/{max_attempts}  exceeded for {func.__name__} due to {type(e).__name__}"
                     )
                     raise
 
@@ -1500,8 +1500,7 @@ def handle_duplicate_image_names(
         duplicate_counter += 1
         for key in bands.keys():
             im_fn[key] = (
-                f"{im_date}_{satname}_{sitename}"
-                f"_{key}_dup{duplicate_counter}{suffix}"
+                f"{im_date}_{satname}_{sitename}_{key}_dup{duplicate_counter}{suffix}"
             )
     return im_fn
 
@@ -2125,7 +2124,6 @@ def retrieve_images(
                     # Sentinel-1 download
                     # =============================================================================================#
                     if satname == "S1":
-
                         result = process_sentinel1_image(
                             image_ee,
                             im_meta,
@@ -2629,11 +2627,11 @@ def retrieve_images(
                         )
                 except Exception as error:
                     print(
-                        f"\nThe download for satellite {satname} image '{im_meta.get('id','unknown')}' failed due to {type(error).__name__ }"
+                        f"\nThe download for satellite {satname} image '{im_meta.get('id', 'unknown')}' failed due to {type(error).__name__}"
                     )
                     print(error)
                     logger.error(
-                        f"The download for satellite {satname} {im_meta.get('id','unknown')} failed due to \n {error} \n Traceback {traceback.format_exc()}"
+                        f"The download for satellite {satname} {im_meta.get('id', 'unknown')} failed due to \n {error} \n Traceback {traceback.format_exc()}"
                     )
                     continue
                 finally:
@@ -2655,7 +2653,7 @@ def retrieve_images(
                             )
                     except Exception as e:
                         logger.error(
-                            f"Could not save metadata for {im_meta.get('id','unknown')} that failed.\n{e}"
+                            f"Could not save metadata for {im_meta.get('id', 'unknown')} that failed.\n{e}"
                         )
                     finally:
                         processed_images_since_flush += (
@@ -3039,7 +3037,7 @@ def remove_existing_imagery(
             ]
             if len(avail_date_list) == 0:
                 print(
-                    f'{satname}:There are {len(avail_date_list)} images available, {len(metadata[satname]["dates"])} images already exist, {len(avail_date_list)} to download'
+                    f"{satname}:There are {len(avail_date_list)} images available, {len(metadata[satname]['dates'])} images already exist, {len(avail_date_list)} to download"
                 )
                 continue
             downloaded_dates = metadata[satname]["dates"]
