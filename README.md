@@ -31,6 +31,56 @@ Our recent updates to the coastsat-package were driven by the goal of enhancing 
   - Minor organizational changes have been implemented to make CoastSat more structured and compatible with packaging standards, improving the overall usability and maintainability of the codebase.
 
 
+## Sentinel-1 SAR Shoreline Extraction (New in v0.5.0)
+
+Shorelines can now be extracted from Sentinel-1 SAR imagery using a trained deep learning model instead of simple thresholding. Because SAR sees through clouds, this makes shoreline mapping possible for scenes and seasons where optical imagery is unusable.
+
+- **Dual-polarization downloads**: Sentinel-1 scenes are downloaded with both VV and VH polarizations by default, stored as one single-band GeoTIFF per polarization (`S1/VV/`, `S1/VH/`).
+- **Model-based segmentation**: at extraction time the bands are stacked into a `[VV, VH, VV−VH]` dB composite and segmented into land/water by a U-Net + ResNet-50 ONNX model (`SAR_3_band_model.onnx`). The shoreline is then extracted as the land/water boundary within the reference shoreline buffer.
+- **Automatic Otsu fallback**: if the model cannot be used for any reason (model unavailable, no internet, single-polarization legacy scene), the run logs a warning and falls back to the legacy Otsu thresholding — it never crashes. You can also force the legacy behavior for a whole run with `settings["sar_segmentation"] = "otsu"`.
+
+### The SAR model downloads automatically
+
+The segmentation model is ~130 MB and is **not included in the package**. The first time you extract shorelines from Sentinel-1 imagery, it is downloaded automatically (once, with a progress bar and checksum verification) from [Hugging Face](https://huggingface.co/2320sharon/SAR_3_band_model) into a per-user cache:
+
+| OS | Download location |
+|---|---|
+| Windows | `%LOCALAPPDATA%\coastsat\coastsat\Cache\SAR_3_band_model.onnx` |
+| Linux | `~/.cache/coastsat/SAR_3_band_model.onnx` |
+| macOS | `~/Library/Caches/coastsat/SAR_3_band_model.onnx` |
+
+Every later run reuses the cached copy — nothing is downloaded twice.
+
+### Downloading the SAR model manually (optional)
+
+If you prefer to download the model yourself — for example on a machine without access to huggingface.co, or to keep the model with your project — download `SAR_3_band_model.onnx` from:
+
+> https://huggingface.co/2320sharon/SAR_3_band_model
+
+Then tell coastsat where it is with the `sar_model_path` setting:
+
+```python
+settings = {
+    # ... your usual settings ...
+    "sar_model_path": r"C:\path\to\SAR_3_band_model.onnx",
+}
+output = SDS_shoreline.extract_shorelines(metadata, settings)
+```
+
+A model given via `sar_model_path` is used as-is and never triggers a download. Alternatively, you can skip the setting entirely by placing the file in one of the locations coastsat already checks: the per-user cache directory from the table above, or (if you work from a git clone) `src/coastsat/classification/models/`.
+
+### Useful SAR settings
+
+| setting | default | meaning |
+|---|---|---|
+| `sar_segmentation` | `"model"` | set to `"otsu"` to force the legacy thresholding for the whole run |
+| `sar_model_path` | auto-resolved | path to a manually downloaded or retrained model |
+| `sar_water_threshold` | `0.5` | probability-of-water cutoff; raise it for higher precision on the water class |
+| `sar_save_probability` | `False` | save the model's water-probability raster for each scene to `S1/prob/` |
+
+See `RELEASE_NOTES_v0.5.0.md` and `SAR_INTEGRATION_GUIDE.md` for the full list of settings, the extraction pipeline in detail, and backward-compatibility notes for sites downloaded with older versions.
+
+
 ## Install CoastSat with conda
 
 1. Create a conda environment
@@ -84,6 +134,29 @@ If you would like to contribute to the further development of coastsat-package p
 2. Create a new branch on your fork
 3. Commit your changes and push them to your branch
 4. When the branch is ready to be merged, create a Pull Request (how to make a clean pull request explained [here](https://gist.github.com/MarcDiethelm/7303312))
+
+### Running the tests
+
+The test suite is an optional add-on to the [pixi](https://pixi.sh) environment. Install it once:
+
+```
+pixi install -e test
+pixi run test
+```
+
+`test` is a small environment: the runtime dependencies plus pytest, and none of the notebook
+or packaging tooling. Available commands:
+
+| command | what it runs |
+| --- | --- |
+| `pixi run test` | the whole suite |
+| `pixi run test tests/test_sar_model.py -k fetch` | any subset — everything after `test` is passed straight to pytest |
+| `pixi run test-cov` | the suite with a coverage report |
+
+Both commands run in the `test` environment whichever environment you invoke them from, so
+there is no `-e` flag to remember.
+
+Without pixi, from a clone: `pip install -e .[test]` and then `pytest`.
 
 # CoastSat
 
