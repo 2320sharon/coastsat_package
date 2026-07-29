@@ -6,11 +6,13 @@ Author: Kilian Vos, Water Research Laboratory, University of New South Wales
 
 # Standard library imports
 import os
+import re
 from datetime import datetime, timedelta
 from typing import List, Dict, Union, Optional
 
 import numpy as np
 import bisect
+import pickle
 
 # Third-party imports
 import geopandas as gpd
@@ -22,15 +24,118 @@ from astropy.convolution import convolve
 from osgeo import gdal, osr
 from scipy import stats, interpolate
 from shapely import geometry
+import skimage.morphology as morphology
 import skimage.transform as transform
 import pytz
 import pdb
-from skimage import io
 import scipy.ndimage
 from PIL import Image
 
+# Canonical order in which Sentinel-1 polarizations are stored on disk and stacked into im_ms.
+# Every place that turns a list of polarizations into folders or image channels uses this order,
+# so the channel order never depends on the order the user happened to list them in.
+SAR_POLARIZATIONS = ("VV", "VH", "HH", "HV")
+
+# Polarizations downloaded when the user does not ask for a specific set. Both are
+# needed for the [VV, VH, VV-VH] composite that the shoreline detection works on.
+DEFAULT_SAR_POLARIZATIONS = ("VV", "VH")
+
+# Bands of the Sentinel-1 composite, built in memory and never written to disk.
+# VV-VH is a dB difference (the linear VV/VH ratio), which suppresses the surface
+# roughness common to both polarizations.
+SAR_COMPOSITE_BANDS = ("VV", "VH", "VV-VH")
+
+# Matches the polarization token in a downloaded SAR filename. The token is not always last:
+# SDS_download.get_file_name() produces '{date}_{sat}_{site}_{polar}_dup{N}.tif' for duplicates.
+_POL_RE = re.compile(
+    r"_(%s)(?=(?:_dup\d+)?\.tif$)" % "|".join(SAR_POLARIZATIONS), re.IGNORECASE
+)
 
 # np.seterr(all='ignore') # raise/ignore divisions by 0 and nans
+
+###################################################################################################
+# SCIKIT-IMAGE COMPATIBILITY
+###################################################################################################
+
+# scikit-image is retiring two spellings we rely on, on different schedules:
+# morphology.square() is deprecated since 0.25 and goes in 0.27, and the
+# morphology.binary_* operators are deprecated since 0.26 and go in 0.28. Their
+# replacements are not available on older installs -- footprint_rectangle() only
+# exists from 0.25. So resolve the spelling against whatever is
+# installed rather than hard-coding either one.
+#
+# Switching binary_dilation()/binary_opening() to dilation()/opening() is only safe
+# because every footprint we pass (square, disk) is symmetric under 180-degree
+# rotation; the deprecation notice warns that the replacements skip the footprint
+# mirroring, which changes results for non-symmetric footprints only. Below 0.25 we
+# keep calling the original binary_* functions, so behaviour on old installs is
+# untouched rather than merely believed-equivalent.
+#
+# One flag drives both swaps, so the operators switch at 0.25 rather than at 0.26
+# when they were actually deprecated. That is deliberate -- it keeps a single
+# version boundary instead of two -- and is safe because dilation()/opening() have
+# accepted boolean input and matched the binary_* results for symmetric footprints
+# for far longer than either deprecation.
+_HAS_FOOTPRINT_RECTANGLE = hasattr(morphology, "footprint_rectangle")
+
+
+def footprint_square(width: int) -> np.ndarray:
+    """Square footprint of side `width`, spelled for the installed scikit-image."""
+    if _HAS_FOOTPRINT_RECTANGLE:
+        return morphology.footprint_rectangle((width, width))
+    return morphology.square(width)
+
+
+def binary_opening(image: np.ndarray, footprint: np.ndarray) -> np.ndarray:
+    """Binary morphological opening, spelled for the installed scikit-image."""
+    if _HAS_FOOTPRINT_RECTANGLE:
+        return morphology.opening(image, footprint)
+    return morphology.binary_opening(image, footprint)
+
+
+def binary_dilation(image: np.ndarray, footprint: np.ndarray) -> np.ndarray:
+    """Binary morphological dilation, spelled for the installed scikit-image."""
+    if _HAS_FOOTPRINT_RECTANGLE:
+        return morphology.dilation(image, footprint)
+    return morphology.binary_dilation(image, footprint)
+
+
+###################################################################################################
+# NUMPY COMPATIBILITY
+###################################################################################################
+
+# NumPy 2 renamed the private numpy.core package to numpy._core, and that name is
+# baked into every .pkl written under NumPy 2. Loading one on NumPy 1.x fails with
+# "ModuleNotFoundError: No module named 'numpy._core...'". NumPy 2 ships a
+# numpy.core shim so the opposite direction already works, which is why only this
+# one direction needs bridging.
+#
+# The remap is attempted only after the real import fails, so on NumPy 2 -- where
+# numpy._core genuinely exists -- this behaves exactly like pickle.Unpickler and
+# nothing changes. Everything used here (Unpickler.find_class) is stdlib and
+# unchanged across every supported Python version.
+
+
+class _NumpyCompatUnpickler(pickle.Unpickler):
+    """Unpickler that can also read NumPy-2-written pickles on NumPy 1.x."""
+
+    def find_class(self, module: str, name: str):
+        # exact package or a submodule of it -- not merely a "numpy._core" prefix
+        if module == "numpy._core" or module.startswith("numpy._core."):
+            try:
+                return super().find_class(module, name)
+            except (ImportError, AttributeError):
+                # numpy._core.numeric -> numpy.core.numeric
+                legacy = "numpy.core" + module[len("numpy._core") :]
+                return super().find_class(legacy, name)
+        return super().find_class(module, name)
+
+
+def load_pickle(filepath: str):
+    """pickle.load() for a file path, tolerant of the NumPy 1/2 module rename."""
+    with open(filepath, "rb") as f:
+        return _NumpyCompatUnpickler(f).load()
+
 
 ###################################################################################################
 # COORDINATES CONVERSION FUNCTIONS
@@ -377,6 +482,91 @@ def get_image_dimensions(image_path):
 ###################################################################################################
 
 
+def get_polarization_from_filename(filename: str) -> Optional[str]:
+    """
+    Returns the polarization token carried by a SAR filename, or None if it has none.
+
+    Arguments:
+    -----------
+    filename: str
+        name of a downloaded SAR image, e.g. '2023-12-03-19-15-49_S1_site_VH.tif'
+
+    Returns:
+    -----------
+    str or None
+        the polarization ('VV', 'VH', 'HH' or 'HV'), or None if the name has no token
+
+    """
+    match = _POL_RE.search(os.path.basename(filename))
+    return match.group(1).upper() if match else None
+
+
+def swap_polarization_in_filename(filename: str, polarization: str) -> str:
+    """
+    Returns the filename with its polarization token replaced by `polarization`.
+
+    Used to find the sibling files of the same scene, which live in a folder per
+    polarization but otherwise share a name.
+
+    Arguments:
+    -----------
+    filename: str
+        name of a downloaded SAR image
+    polarization: str
+        polarization to substitute in
+
+    Returns:
+    -----------
+    str
+        the filename with the new polarization token, unchanged if it had none
+
+    """
+    if not _POL_RE.search(os.path.basename(filename)):
+        return filename
+    return _POL_RE.sub(f"_{polarization}", filename, count=1)
+
+
+# How a shoreline was derived, recorded per scene in output['segmentation_method'].
+# It says what output['MNDWI_threshold'] holds for that scene, which is the only way to
+# know whether a threshold-range filter can be applied to it - see
+# SDS_transects.threshold_filter_applies.
+SEGMENTATION_MNDWI = "mndwi"  # optical: MNDWI contour, threshold is an MNDWI value
+SEGMENTATION_SAR_OTSU = "sar_otsu"  # SAR: Otsu threshold, in dB
+SEGMENTATION_SAR_MODEL = "sar_model"  # SAR: ONNX segmentation, no threshold (NaN)
+
+
+def build_sar_composite(im_polarizations, polarizations):
+    """
+    Builds the [VV, VH, VV-VH] composite from a stack of polarization bands.
+
+    The third band is the dB difference of the first two. Returns None when the
+    scene does not carry both VV and VH, which is the case for images downloaded
+    before multi-polarization support.
+
+    Arguments:
+    -----------
+    im_polarizations: np.ndarray
+        (H, W, n) stack of polarization bands, as returned by read_sar_image
+    polarizations: list of str
+        polarization of each channel, in the same order
+
+    Returns:
+    -----------
+    np.ndarray or None
+        (H, W, 3) composite with bands SAR_COMPOSITE_BANDS, or None if VV and VH
+        are not both available
+
+    """
+    polarizations = list(polarizations)
+    if "VV" not in polarizations or "VH" not in polarizations:
+        return None
+
+    im_vv = im_polarizations[:, :, polarizations.index("VV")]
+    im_vh = im_polarizations[:, :, polarizations.index("VH")]
+
+    return np.stack([im_vv, im_vh, im_vv - im_vh], axis=2)
+
+
 def create_folder_structure(im_folder, satname, polars: Optional[str] = None):
     """
     Create the structure of subfolders for each satellite mission
@@ -389,11 +579,16 @@ def create_folder_structure(im_folder, satname, polars: Optional[str] = None):
         folder where the images are to be downloaded
     satname:
         name of the satellite mission
+    polars: str or list of str, optional
+        Sentinel-1 polarizations to create a folder for, e.g. ['VV','VH'].
+        Ignored for the optical missions. Defaults to DEFAULT_SAR_POLARIZATIONS.
 
     Returns:
     -----------
     filepaths: list of str
-        filepaths of the folders that were created
+        filepaths of the folders that were created. The first entry is always the
+        metadata folder; for S1 the rest are one folder per polarization, in
+        SAR_POLARIZATIONS order.
     """
 
     # one folder for the metadata (common to all satellites)
@@ -411,12 +606,17 @@ def create_folder_structure(im_folder, satname, polars: Optional[str] = None):
         filepaths.append(os.path.join(im_folder, satname, "swir"))
         filepaths.append(os.path.join(im_folder, satname, "mask"))
     elif satname in ["S1"]:
+        # one folder per polarization, each holding one single-band .tif per scene
         if not polars:
-            polars = ["VH"]
+            polars = list(DEFAULT_SAR_POLARIZATIONS)
         if isinstance(polars, str):
             polars = [polars]
-        for polar in polars:
-            filepaths.append(os.path.join(im_folder, satname, polar))
+        requested = {
+            str(polar).strip().upper() for polar in polars if str(polar).strip()
+        }
+        for polar in SAR_POLARIZATIONS:
+            if polar in requested:
+                filepaths.append(os.path.join(im_folder, satname, polar))
     # create the subfolders if they don't exist already
     for fp in filepaths:
         os.makedirs(fp, exist_ok=True)
@@ -424,34 +624,99 @@ def create_folder_structure(im_folder, satname, polars: Optional[str] = None):
     return filepaths
 
 
-def read_sar_image(file_path):
+def read_sar_image(file_paths):
     """
-    Reads a SAR image file, creates a three-channel image from the first band,
-    and returns the processed image along with its georeference transformation.
+    Reads the SAR image file(s) of one scene and stacks them into a single array.
+
+    Each polarization of a scene is stored as its own single-band .tif in its own
+    folder, so this takes one path per polarization and returns them stacked. The
+    channel order is the order of `file_paths`, which get_filenames() produces in
+    SAR_POLARIZATIONS order.
 
     Parameters:
-        file_path (str): Path to the SAR image file.
+        file_paths (str or list of str): Path(s) to the SAR image file(s) of one scene.
 
     Returns:
-        im (np.ndarray): The processed image with three channels.
+        im (np.ndarray): The image with one channel per polarization, shape (H, W, n).
         georef (np.ndarray): The georeference transformation array.
     """
-    # Open the file using GDAL
-    data = gdal.Open(file_path)
-    if data is None:
-        raise IOError(f"Could not open file: {file_path}")
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
+    if len(file_paths) == 0:
+        raise ValueError("No SAR image files were provided.")
 
-    # Read all bands as arrays
-    bands = [data.GetRasterBand(k + 1).ReadAsArray() for k in range(data.RasterCount)]
+    arrays = []
+    georef = None
+    ref_shape = None
+    ref_path = None
+    for file_path in file_paths:
+        # Open the file using GDAL
+        data = gdal.Open(file_path, gdal.GA_ReadOnly)
+        if data is None:
+            raise IOError(f"Could not open file: {file_path}")
 
-    # Use the first band to create a 3-channel image
-    im_2d = bands[0]
-    im = np.repeat(im_2d[:, :, np.newaxis], 3, axis=2)
+        # each polarization file holds a single band
+        band = data.GetRasterBand(1).ReadAsArray()
+        geotransform = np.array(data.GetGeoTransform())
 
-    # Obtain the georeference transformation and convert to a NumPy array
-    georef = np.array(data.GetGeoTransform())
+        if georef is None:
+            georef, ref_shape, ref_path = geotransform, band.shape, file_path
+        elif band.shape != ref_shape or not np.allclose(geotransform, georef):
+            # the polarizations of one scene must share a grid or the stack is meaningless
+            raise ValueError(
+                "SAR polarization files are not on the same grid: "
+                f"'{ref_path}' {ref_shape} vs '{file_path}' {band.shape}"
+            )
+        arrays.append(band)
+
+    im = np.stack(arrays, axis=2)
 
     return im, georef
+
+
+def read_sar_valid_mask(file_paths):
+    """
+    Reads the per-pixel validity mask of one SAR scene.
+
+    A pixel is valid where every polarization file of the scene both reports it as valid
+    (GDAL mask band, which honours the raster's nodata value) and holds a finite value.
+    This is what the segmentation model uses to decide which pixels to neutralise on
+    input and to blank out of the prediction, so that blank areas of a partially covered
+    scene never produce a land or water call.
+
+    Note the downloaded Sentinel-1 rasters carry nodata = 0.0, and 0 dB is a physically
+    meaningful backscatter value, so a genuinely 0.0 dB pixel is treated as invalid.
+    That is what the model's inference guide specifies and it did not occur in any of
+    the scenes checked, but it is a real edge case.
+
+    Call read_sar_image() first: it validates that the polarizations share a grid, which
+    this function assumes.
+
+    Parameters:
+        file_paths (str or list of str): Path(s) to the SAR image file(s) of one scene.
+
+    Returns:
+        valid (np.ndarray): (H, W) boolean, True where every polarization is usable.
+    """
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
+    if len(file_paths) == 0:
+        raise ValueError("No SAR image files were provided.")
+
+    valid = None
+    for file_path in file_paths:
+        data = gdal.Open(file_path, gdal.GA_ReadOnly)
+        if data is None:
+            raise IOError(f"Could not open file: {file_path}")
+
+        band = data.GetRasterBand(1)
+        # the mask band is all 255 when the raster declares no nodata value
+        band_valid = band.GetMaskBand().ReadAsArray() > 0
+        band_valid &= np.isfinite(band.ReadAsArray())
+
+        valid = band_valid if valid is None else (valid & band_valid)
+
+    return valid
 
 
 def get_filepath(inputs, satname):
@@ -517,9 +782,15 @@ def get_filepath(inputs, satname):
         fp_mask = os.path.join(filepath_data, sitename, satname, "mask")
         filepath = [fp_ms, fp_swir, fp_mask]
     elif satname == "S1":
-        # access downloaded Sentinel 1 images
-        fp_vh = os.path.join(filepath_data, sitename, satname, "VH")
-        filepath = [fp_vh]
+        # access downloaded Sentinel 1 images: one folder per polarization.
+        # Only the folders that exist are returned, so a session downloaded before
+        # multi-polarization support (VH only) still resolves.
+        s1_root = os.path.join(filepath_data, sitename, satname)
+        filepath = [
+            os.path.join(s1_root, polar)
+            for polar in SAR_POLARIZATIONS
+            if os.path.isdir(os.path.join(s1_root, polar))
+        ]
 
     return filepath
 
@@ -540,13 +811,16 @@ def get_filenames(filename, filepath, satname):
         For Landsat 5, it would be [fp_ms, fp_mask]
         For Landsat 7, 8 and 9, it would be [fp_ms, fp_pan, fp_mask]
         For Sentinel 2, it would be [fp_ms, fp_swir, fp_mask]
+        For Sentinel 1, it would be one folder per polarization, e.g. [fp_VV, fp_VH]
     satname: str
         short name of the satellite mission
 
     Returns:
     -----------
     fn: str or list of str
-        contains the filepath + filenames to access the satellite image
+        contains the filepath + filenames to access the satellite image.
+        For Sentinel 1 this is one path per polarization present on disk, in
+        SAR_POLARIZATIONS order, which is the order read_sar_image() stacks them.
 
     """
 
@@ -570,10 +844,21 @@ def get_filenames(filename, filepath, satname):
             os.path.join(filepath[2], fn_mask),
         ]
     if satname == "S1":
-        # S1 only has 1 band VH
-        fn = [
-            os.path.join(filepath[0], filename),
-        ]
+        # each polarization of the scene lives in its own folder but shares a name
+        # apart from the polarization token, so derive the siblings from filename.
+        # Only the files that exist are returned: a scene downloaded before
+        # multi-polarization support has VH only, and may sit next to newer VV+VH scenes.
+        candidates = filepath if isinstance(filepath, (list, tuple)) else [filepath]
+        fn = []
+        for folder in candidates:
+            polar = os.path.basename(folder)
+            path = os.path.join(folder, swap_polarization_in_filename(filename, polar))
+            if os.path.exists(path):
+                fn.append(path)
+        if not fn:
+            raise FileNotFoundError(
+                f"No Sentinel-1 image found for '{filename}' in {list(candidates)}"
+            )
 
     return fn
 

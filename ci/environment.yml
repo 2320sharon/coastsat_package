@@ -1,0 +1,70 @@
+# Conda spec for the GitHub Actions test matrix (.github/workflows/tests.yml).
+#
+# This mirrors [tool.pixi.dependencies] in pyproject.toml with exactly ONE deliberate
+# difference: there is no `python` entry. Pixi pins python = "3.11.*" because a lockfile is
+# single-interpreter by construction, so pixi cannot drive a multi-version matrix. The
+# workflow injects the interpreter per leg with `create-args: python=${{ matrix.python-version }}`.
+# Adding `python` here would silently collapse all twelve legs onto one interpreter and the
+# matrix would still report twelve green checks.
+#
+# KEEP IN SYNC BY HAND with [tool.pixi.dependencies]. pixi.lock cannot generate this file and
+# nothing enforces the correspondence.
+name: coastsat-ci
+channels:
+  - conda-forge
+dependencies:
+  # --- the interpreter is injected by the workflow. Do not add `python` here. ---
+  - pip
+
+  - astropy
+  - "earthengine-api>=0.1.304"
+  # The reason this file exists at all. GDAL publishes no wheels on PyPI, and
+  # SDS_tools.py, SDS_preprocess.py and gdal_merge.py all do `from osgeo import gdal` at
+  # module scope, so a plain actions/setup-python job cannot import a single coastsat
+  # submodule -- never mind run the nine test files that use it.
+  - gdal
+  - geopandas
+  - google-auth
+  - imageio
+  - importlib_resources
+  # SDS_shoreline loads the .pkl classifiers with joblib.load; it only reaches the
+  # environment today as a scikit-learn transitive dep, so declare it directly.
+  - joblib
+  # The conda-forge `matplotlib` metapackage is matplotlib-base plus a GUI toolkit (it pulls
+  # pyqt). Nothing under test touches a canvas -- MPLBACKEND=Agg is set at the job level --
+  # so swapping this to `matplotlib-base` and dropping `pyqt` below is the lever to reach for
+  # if a leg fails to solve. Kept as the metapackage so CI installs what pixi installs.
+  - matplotlib
+  # numpy 2 on purpose. Pickles written under numpy 2 reference `numpy._core`, which numpy
+  # 1.x cannot import at all. See the long comment on [tool.pixi.dependencies].numpy in
+  # pyproject.toml before changing this.
+  - "numpy>=2"
+  # Pin the CPU build exactly as pixi does. On GitHub-hosted runners this is belt-and-braces
+  # -- no NVIDIA driver means no __cuda virtual package, so the CUDA builds are unsatisfiable
+  # and the solver picks a CPU build regardless of its higher build number. Kept anyway: it
+  # makes the solve deterministic instead of relying on that inference, it keeps this file
+  # verifiably identical to pyproject.toml, and it survives a future move to a GPU-equipped
+  # or self-hosted runner where the ~2.9 GB CUDA variant would otherwise appear silently.
+  - "onnxruntime=*=*cpu*"
+  - pandas
+  - pillow
+  - pooch
+  # First candidate for removal (together with matplotlib -> matplotlib-base). Qt5 is
+  # upstream-EOL, qt-main is ~250 MB, and this is the single spec most likely to lag behind a
+  # new Python minor on conda-forge -- so if one leg fails to solve, expect it to be this.
+  - "pyqt=5.15.*"
+  - pytz
+  - requests
+  # Floor, not a pin. Left open, the solver settles on scikit-image 0.20.0, which caps numpy
+  # at <2.0a0 and would quietly undo the numpy floor above.
+  - "scikit-image>=0.25"
+  - scikit-learn
+  - scipy
+  - shapely
+  - tqdm
+
+  # Test tooling, mirroring [tool.pixi.feature.test.dependencies]. Installed from conda-forge
+  # so that pip never has to resolve anything into this environment -- see the --no-deps note
+  # in the workflow.
+  - "pytest>=8"
+  - "pytest-cov>=5"
