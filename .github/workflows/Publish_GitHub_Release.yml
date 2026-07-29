@@ -26,13 +26,16 @@ jobs:
         shell: bash -l {0}
     steps:
       - name: 📦 Checkout project repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
-          # Load the last 1 commits
+          # Full history: generateReleaseNotes diffs against the previous tag to build the
+          # changelog, which a shallow clone cannot see.
           fetch-depth: 0
-      - name: 🏃Create A Draft Github Release
+      - name: 🏃Create A Github Release
         uses: ncipollo/release-action@v1
         with:
           generateReleaseNotes: true
           draft: false
-          makeLatest: false
+          # Mark the newest version tag as "Latest" on the releases page. Left false, every
+          # release stays unmarked and the page keeps pointing at whatever was last flagged.
+          makeLatest: true
