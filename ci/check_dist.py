@@ -4,14 +4,15 @@ Run after `python -m build`:
 
     python ci/check_dist.py dist/
 
-Source-tree tests never see packaging bugs, so this is the only thing standing between a
-mis-specified glob and a broken release. Two mechanisms decide what lands in the wheel and
-they have to keep agreeing:
+Source-tree tests never see packaging bugs, so this is the only guard between a mis-specified
+glob and a broken release. What ships is decided by:
 
-  * MANIFEST.in `graft src` sweeps in every file sitting under src/, which is why scratch
-    modules and the 130 MB SAR model can ride along if nobody is looking;
-  * [tool.setuptools.package-data] / [tool.setuptools.exclude-package-data] in
-    pyproject.toml decide which of those survive into the wheel.
+  * the layout -- [tool.setuptools.packages.find] searches only `where = ["src"]`, so the
+    root-level training inputs and notebook cannot be packaged at all, which is why no
+    exclude rules are needed for them;
+  * MANIFEST.in, for the sdist -- `graft src` takes everything under src/, which is how
+    scratch modules and the 130 MB SAR model can ride along;
+  * [tool.setuptools.package-data] -- the classifiers under classification/models/.
 
 Exit status is 0 when everything checks out, 1 with a description of what is wrong otherwise.
 """
@@ -53,37 +54,35 @@ CLASSIFIER_STEMS = [
     "Landsat_bright_new",
 ]
 
-# SDS_shoreline does `from coastsat.classification import models, training_data,
-# training_sites`, so all three need an __init__.py in the wheel -- the packages must import
-# even though the payloads of training_data and training_sites are deliberately excluded
-# below. The classifiers under models/ are the only data the library actually loads.
+# SDS_shoreline does `from coastsat.classification import models` and loads the classifiers
+# beneath it -- the only part of classification/ the library needs.
 REQUIRED_DATA = [
     "coastsat/classification/__init__.py",
     "coastsat/classification/models/__init__.py",
-    "coastsat/classification/training_data/__init__.py",
-    "coastsat/classification/training_sites/__init__.py",
-] + [f"coastsat/classification/models/NN_4classes_{stem}.pkl" for stem in CLASSIFIER_STEMS]
+] + [
+    f"coastsat/classification/models/NN_4classes_{stem}.pkl"
+    for stem in CLASSIFIER_STEMS
+]
 
 FORBIDDEN = [
     # SAR_3_band_model.onnx is ~130 MB, over PyPI's per-file limit.
-    # SDS_sar_model.fetch_default_sar_model() pooch-downloads it on demand instead.
     ("*.onnx", "the SAR model is fetched at runtime, never shipped"),
     # Scratch modules that `graft src` would otherwise happily package.
     ("*_no_use.py", "scratch module"),
     ("coastsat/tests/*", "tests are not part of the distribution"),
-    # The CoastSat_training_set_*.pkl files are 32.2 MB, nothing reads them at runtime, and
-    # they are meant to exist in git only.
+    # Root-level and git-only. These catch a regression that moves either back under src/,
+    # where package discovery would find it again. Leading `*` because fnmatch spans "/".
     (
-        "coastsat/classification/training_data/*.pkl",
-        "the training sets are git-only and must not ship",
+        "*training_data/*",
+        "training_data is git-only and must not ship at all",
     ),
-    # Same story for the training-site regions of interest. Nothing in the library reads
-    # them -- SDS_shoreline imports the training_sites package but never uses the name, and
-    # the .kml readers in SDS_tools take a user-supplied path. Their only consumer is
-    # train_new_classifier.ipynb, which resolves os.getcwd()/training_sites from a checkout.
     (
-        "coastsat/classification/training_sites/*.kml",
-        "the training-site .kml files are git-only and must not ship",
+        "*training_sites/*",
+        "training_sites is git-only and must not ship at all",
+    ),
+    (
+        "*.ipynb",
+        "the notebooks require a checkout and are not part of the distribution",
     ),
 ]
 
@@ -92,19 +91,20 @@ FORBIDDEN = [
 # -- a wheel-only assertion would pass happily while `pip install` from source pulled 32 MB.
 SDIST_FORBIDDEN = [
     ("*.onnx", "the SAR model is fetched at runtime, never shipped"),
+    # MANIFEST.in includes nothing outside src/, so these only fire if a broader directive
+    # is added there. Match at any depth.
+    ("*/training_data/*", "training_data is git-only and must not ship at all"),
+    ("*/training_sites/*", "training_sites is git-only and must not ship at all"),
+    # setuptools adds tests/ by default, so this one guards a MANIFEST.in `prune`
+    ("*/tests/*", "tests are not part of the distribution"),
     (
-        "*/src/coastsat/classification/training_data/*.pkl",
-        "the training sets are git-only and must not ship",
-    ),
-    (
-        "*/src/coastsat/classification/training_sites/*.kml",
-        "the training-site .kml files are git-only and must not ship",
+        "*.ipynb",
+        "the notebooks require a checkout and are not part of the distribution",
     ),
 ]
 
-# The wheel is ~0.7 MB once the training sets are excluded. A ceiling well above that but far
-# below the 33 MB it would reach if the exclusion broke turns a silent size regression into a
-# failed build. Raise it deliberately if real package data is ever added.
+
+# Set a ceiling below 33 MB limit so that a silent size regression is turned into a failed build.
 MAX_WHEEL_MB = 5.0
 
 SDIST_REQUIRED = ["pyproject.toml", "LICENSE.md", "README.md", "PKG-INFO"]
@@ -119,9 +119,13 @@ def main(dist_dir: str = "dist") -> None:
     wheels = glob.glob(os.path.join(dist_dir, "*.whl"))
     sdists = glob.glob(os.path.join(dist_dir, "*.tar.gz"))
     if len(wheels) != 1:
-        fail(f"expected exactly one wheel in {dist_dir}/, found {len(wheels)}: {wheels}")
+        fail(
+            f"expected exactly one wheel in {dist_dir}/, found {len(wheels)}: {wheels}"
+        )
     if len(sdists) != 1:
-        fail(f"expected exactly one sdist in {dist_dir}/, found {len(sdists)}: {sdists}")
+        fail(
+            f"expected exactly one sdist in {dist_dir}/, found {len(sdists)}: {sdists}"
+        )
     (wheel,) = wheels
     (sdist,) = sdists
 
@@ -148,7 +152,8 @@ def main(dist_dir: str = "dist") -> None:
     if size_mb > MAX_WHEEL_MB:
         fail(
             f"wheel is {size_mb:.1f} MB, over the {MAX_WHEEL_MB} MB ceiling -- check that "
-            f"[tool.setuptools.exclude-package-data] still has BOTH of its keys"
+            f"training_data/ and training_sites/ are still at the repository root rather "
+            f"than under src/, where package discovery would pick them up again"
         )
 
     sdist_names = tarfile.open(sdist).getnames()
@@ -159,7 +164,10 @@ def main(dist_dir: str = "dist") -> None:
     for pattern, reason in SDIST_FORBIDDEN:
         hits = sorted(n for n in sdist_names if fnmatch.fnmatch(n, pattern))
         if hits:
-            fail(f"{pattern} must not ship in the sdist ({reason}):\n  " + "\n  ".join(hits))
+            fail(
+                f"{pattern} must not ship in the sdist ({reason}):\n  "
+                + "\n  ".join(hits)
+            )
 
     print(f"wheel  {os.path.basename(wheel)}  {size_mb:.2f} MB  {len(names)} entries")
     print(f"sdist  {os.path.basename(sdist)}  {len(sdist_names)} entries")

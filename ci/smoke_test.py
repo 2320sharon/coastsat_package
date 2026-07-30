@@ -30,12 +30,16 @@ MODULES = [
     "coastsat.SDS_classify",
     "coastsat.SDS_sar_model",
     "coastsat.gdal_merge",
-    # SDS_shoreline does `from coastsat.classification import models, training_data,
-    # training_sites`, so all three have to resolve from the installed wheel. Whether they do
-    # depends on package discovery agreeing with the package-data globs, which is exactly the
-    # kind of thing that only breaks once it is packaged.
+    # SDS_shoreline does `from coastsat.classification import models`, so these two have to
+    # resolve from the installed wheel -- a packaging-only failure mode.
     "coastsat.classification",
     "coastsat.classification.models",
+]
+
+# Not packages anywhere: they live at the repository root, outside `where = ["src"]`.
+# SDS_shoreline used to import both without using either, which broke importing it from a
+# wheel. Checked unconditionally so an editable install cannot hide that.
+ABSENT_PACKAGES = [
     "coastsat.classification.training_data",
     "coastsat.classification.training_sites",
 ]
@@ -84,24 +88,17 @@ def main() -> None:
             sys.exit(f"classifier looks truncated: {path}")
     print(f"all {len(CLASSIFIER_STEMS)} classifiers present")
 
-    # training_sites and training_data ship as importable packages with no payload -- their
-    # .kml and .pkl contents are git-only. SDS_shoreline imports both names at module scope,
-    # so what matters is that the packages resolve, which the import loop above proved.
-    import importlib.resources as resources
-
-    from coastsat.classification import training_sites
-
-    sites_dir = os.path.abspath(resources.files(training_sites))
-
-    # Only meaningful against a real installation. Under the editable install used for local
-    # runs this resolves into the checkout, where the .kml files are present and correct.
-    if args.require_installed:
-        stowaways = sorted(f for f in os.listdir(sites_dir) if f.endswith(".kml"))
-        if stowaways:
-            sys.exit(f"training-site .kml files are git-only but shipped: {stowaways}")
-        print(f"training_sites importable and payload-free: {sites_dir}")
-    else:
-        print(f"training_sites importable: {sites_dir}")
+    # Valid against a real install and the editable one alike: not packages in either.
+    print()
+    for name in ABSENT_PACKAGES:
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            print(f"ok  {name:44s} correctly absent")
+            continue
+        sys.exit(
+            f"{name} is git-only but importable: {getattr(module, '__file__', '<namespace>')}"
+        )
 
     print("\nsmoke test OK")
 

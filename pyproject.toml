@@ -94,10 +94,6 @@ include = ["coastsat*"]
 [tool.setuptools.package-data]
 "coastsat.classification.models" = ["*.pkl"]
 
-[tool.setuptools.exclude-package-data]
-"coastsat.classification.training_data" = ["*.pkl"]
-"coastsat.classification.training_sites" = ["*.kml"]
-
 [tool.pixi.workspace]
 channels = ["conda-forge"]
 channel-priority = "strict"

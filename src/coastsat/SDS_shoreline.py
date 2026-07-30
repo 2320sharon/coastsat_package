@@ -35,7 +35,7 @@ from tqdm.auto import tqdm
 from coastsat import SDS_preprocess, SDS_sar_model, SDS_tools
 from coastsat.SDS_tools import create_geometry
 from coastsat.SDS_download import release_logger, setup_logger
-from coastsat.classification import models, training_data, training_sites
+from coastsat.classification import models
 
 # set numpy error handling
 np.seterr(all="ignore")  # raise/ignore divisions by 0 and nans

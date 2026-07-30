@@ -4,56 +4,17 @@ include pyproject.toml
 # README.md is required: pyproject.toml sets readme = "README.md".
 include README.md
 
-# [tool.pixi.workspace.conda-pypi-map] in pyproject.toml points at this file by
-# relative path. pip never reads that table, but without this line an unpacked
-# sdist has a pyproject.toml referencing a file that isn't there, so `pixi install` from the sdist fails.
+# pyproject.toml's [tool.pixi.workspace.conda-pypi-map] points at this file by relative path,
+# so an sdist without it fails `pixi install`.
 include conda-pypi-map.json
 
-# Include src directories in package
 graft src
 
-# The 130 MB SAR .onnx model is downloaded on demand (SDS_sar_model), never shipped
+# The SAR .onnx model is downloaded on demand (SDS_sar_model), never shipped
 recursive-exclude src *.onnx
 
-# exclude the training dataset that coastsat comes with by default (git only)
-# Must come after `graft src` above -- MANIFEST.in directives apply in order.
-recursive-exclude src/coastsat/classification/training_data *.pkl
-
-# Same for the training-site regions of interest (git only). Nothing in the library
-# reads them: SDS_shoreline imports the training_sites package but never uses the
-# name, and the .kml readers in SDS_tools take a user-supplied path. Only
-# train_new_classifier.ipynb wants them, from os.getcwd()/training_sites.
-# The matching [tool.setuptools.exclude-package-data] key covers the wheel; this
-# line is the sdist half, since include-package-data = true means the wheel
-# otherwise inherits whatever the sdist carries.
-recursive-exclude src/coastsat/classification/training_sites *.kml
-
-
-# Remove the pycache directory and any pycache files
-prune src/coastsat/__pycache__
+# graft src would otherwise sweep in compiled files
 recursive-exclude * *.py[co]
 
-# don't include the tests, docs, scripts or paper
+# setuptools adds tests/ to the sdist by default -- load-bearing, verified
 prune tests
-prune docs
-prune scripts
-prune paper
-
-
-exclude .gitignore
-exclude .gitattributes
-prune .git
-prune .github
-exclude .editorconfig
-exclude .pre-commit-config.yaml
-exclude .flake8
-exclude .pylintrc
-exclude tox.ini
-
-prune build
-prune dist
-
-exclude *.log
-prune __pycache__
-
-
