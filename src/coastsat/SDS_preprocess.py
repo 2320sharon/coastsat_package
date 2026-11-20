@@ -971,13 +971,12 @@ def create_cloud_mask(im_QA, satname, cloud_mask_issue, collection):
             def is_set(x, n):
                 return x & 1 << n != 0
 
-            # dilated cloud = bit 1
             # cirrus = bit 2
             # cloud = bit 3
             qa_values = np.unique(im_QA.flatten())
             cloud_values = []
             for qaval in qa_values:
-                for k in [1, 2, 3]:  # check the first 3 flags
+                for k in [2, 3]:  # check the cirrus and cloud flags
                     if is_set(qaval, k):
                         cloud_values.append(qaval)
 
